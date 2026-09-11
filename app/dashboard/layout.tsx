@@ -7,7 +7,6 @@ import { Header } from "@/components/layout/Header";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { TabBar } from "@/components/layout/TabBar";
 import { ElectronNotificationHandler } from "@/components/ElectronNotificationHandler";
-import { NotificationManager } from "@/components/NotificationManager";
 import { ActivityLogger } from "@/components/ActivityLogger";
 import { AutoSync } from "@/components/AutoSync";
 import { AppShell } from "@/components/layout/AppShell";
@@ -61,7 +60,6 @@ export default async function DashboardLayout({
   return (
     <div className="flex flex-col h-screen overflow-hidden">
       <ElectronNotificationHandler />
-      <NotificationManager />
       <ActivityLogger />
       <AutoSync />
 

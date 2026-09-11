@@ -13,7 +13,6 @@ import {
     Trophy,
 } from "lucide-react";
 import { NotificationDropdown } from "@/components/employee/NotificationDropdown";
-import { NotificationManager } from "@/components/NotificationManager";
 
 const navItems = [
     { href: "/employee", label: "الرئيسية", icon: LayoutDashboard },
@@ -30,7 +29,6 @@ export default function EmployeeLayout({ children }: { children: React.ReactNode
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100" dir="rtl">
-            <NotificationManager />
             {/* Top Navigation Bar */}
             <header className="bg-white shadow-sm border-b sticky top-0 z-50">
                 <div className="max-w-5xl mx-auto px-4 py-4">

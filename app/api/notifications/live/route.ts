@@ -89,24 +89,21 @@ export async function GET(request: NextRequest) {
   const messageEvents = canViewInbox
     ? await query<LiveNotificationRow>(
         `SELECT
-           CONCAT('message:', pm.id) AS id,
+           CONCAT('browser-message:', bmn.event_id) AS id,
            'message' AS kind,
            CONCAT(
              'رسالة جديدة من ',
-             COALESCE(NULLIF(pm.guest_name, ''), 'ضيف'),
+             COALESCE(NULLIF(bmn.guest_name, ''), 'ضيف'),
              ' — ',
-             CASE WHEN pm.platform = 'airbnb' THEN 'Airbnb' ELSE 'Gathern' END
+             CASE WHEN bmn.platform = 'airbnb' THEN 'Airbnb' ELSE 'Gathern' END
            ) AS title,
-           COALESCE(NULLIF(pm.message_text, ''), 'رسالة جديدة') AS body,
-           DATE_FORMAT(pm.created_at, '%Y-%m-%d %H:%i:%s.%f') AS createdAt,
-           CONCAT('/dashboard/inbox?threadId=',
-             REPLACE(REPLACE(pm.thread_id, '%', '%25'), ' ', '%20')) AS href
-         FROM platform_messages pm
-         WHERE pm.is_from_me = 0
-           AND pm.platform IN ('airbnb', 'gathern')
-           AND pm.created_at >= DATE_SUB(?, INTERVAL 3 SECOND)
-           AND pm.created_at <= ?
-         ORDER BY pm.created_at ASC, pm.id ASC
+           COALESCE(NULLIF(bmn.message_preview, ''), 'رسالة جديدة') AS body,
+           DATE_FORMAT(bmn.detected_at, '%Y-%m-%d %H:%i:%s.%f') AS createdAt,
+           '/dashboard/inbox' AS href
+         FROM browser_message_notifications bmn
+         WHERE bmn.detected_at >= DATE_SUB(?, INTERVAL 3 SECOND)
+           AND bmn.detected_at <= ?
+         ORDER BY bmn.detected_at ASC, bmn.event_id ASC
          LIMIT 50`,
         [since, clock.cursor]
       )

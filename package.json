@@ -19,7 +19,8 @@
     "electron:compile": "tsc -p electron/tsconfig.json",
     "postinstall": "electron-builder install-app-deps",
     "start-polling": "ts-node --project scripts/tsconfig.json --transpile-only scripts/inbox-sync-service.ts",
-    "start-sync": "ts-node --project scripts/tsconfig.json --transpile-only scripts/inbox-sync-service.ts"
+    "start-sync": "ts-node --project scripts/tsconfig.json --transpile-only scripts/inbox-sync-service.ts",
+    "start:notification-worker": "ts-node --project scripts/tsconfig.json --transpile-only scripts/notification-worker.ts"
   },
   "dependencies": {
     "@react-pdf/renderer": "^4.5.1",
