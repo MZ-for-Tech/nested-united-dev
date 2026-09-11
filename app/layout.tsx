@@ -1,12 +1,23 @@
 import type { Metadata } from "next";
-import { Cairo } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 import { AuthProvider } from "@/components/providers/AuthProvider";
 import { DialogProvider } from "@/components/accounting/DialogProvider";
 
-const cairo = Cairo({
-  subsets: ["arabic"],
-  weight: ["400", "600", "700"],
+const notoKufiArabic = localFont({
+  src: [
+    {
+      path: "../public/fonts/NotoKufiArabic-Regular.ttf",
+      weight: "400",
+      style: "normal",
+    },
+    {
+      path: "../public/fonts/NotoKufiArabic-Bold.ttf",
+      weight: "700",
+      style: "normal",
+    },
+  ],
+  display: "swap",
   variable: "--font-cairo",
 });
 
@@ -33,7 +44,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ar" dir="rtl" suppressHydrationWarning>
-      <body className={`${cairo.variable} antialiased`} suppressHydrationWarning>
+      <body className={`${notoKufiArabic.variable} antialiased`} suppressHydrationWarning>
         <AuthProvider>
           <DialogProvider>
             {children}
