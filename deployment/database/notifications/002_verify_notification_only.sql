@@ -1,13 +1,9 @@
 -- Read-only verification. Safe to run before or after starting the worker.
 
-SELECT
-  table_name,
-  engine,
-  table_rows
-FROM information_schema.tables
-WHERE table_schema = DATABASE()
-  AND table_name IN ('browser_notification_state', 'browser_message_notifications')
-ORDER BY table_name;
+USE rentals_dashboard;
+
+SHOW TABLES LIKE 'browser_notification_state';
+SHOW TABLES LIKE 'browser_message_notifications';
 
 SELECT
   platform,

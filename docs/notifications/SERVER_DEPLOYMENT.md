@@ -51,7 +51,7 @@ With the MariaDB/MySQL command-line client from `cmd.exe`:
 mysql.exe -h 127.0.0.1 -u YOUR_DB_USER -p rentals_dashboard < C:\inetpub\wwwroot\nested-united\deployment\database\notifications\001_notification_only.sql
 ```
 
-Alternatively, open the file in HeidiSQL/phpMyAdmin, select the production database, and execute the full file. A successful result lists both new tables. Never put the database password directly in command history.
+Alternatively, use the Import tab in HeidiSQL/phpMyAdmin and upload the SQL file itself. Do not copy it from rendered chat text. The file explicitly selects `rentals_dashboard`; a successful result lists both new tables. Never put the database password directly in command history.
 
 Then run the read-only verification file:
 

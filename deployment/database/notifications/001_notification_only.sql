@@ -1,6 +1,8 @@
 -- Notification-only migration for MariaDB 10.4+
 -- Additive and idempotent: it does not alter or delete existing inbox data.
 
+USE rentals_dashboard;
+
 CREATE TABLE IF NOT EXISTS browser_notification_state (
   browser_account_id CHAR(36) NOT NULL,
   platform ENUM('airbnb', 'gathern') NOT NULL,
@@ -35,11 +37,5 @@ CREATE TABLE IF NOT EXISTS browser_message_notifications (
     ON UPDATE RESTRICT ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-SELECT
-  table_name,
-  engine,
-  table_rows
-FROM information_schema.tables
-WHERE table_schema = DATABASE()
-  AND table_name IN ('browser_notification_state', 'browser_message_notifications')
-ORDER BY table_name;
+SHOW TABLES LIKE 'browser_notification_state';
+SHOW TABLES LIKE 'browser_message_notifications';

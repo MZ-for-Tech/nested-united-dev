@@ -19,13 +19,17 @@ describe("notification-only database scripts", () => {
     const migration = withoutComments(readSql("001_notification_only.sql"));
     expect(migration).toContain("CREATE TABLE IF NOT EXISTS browser_notification_state");
     expect(migration).toContain("CREATE TABLE IF NOT EXISTS browser_message_notifications");
+    expect(migration).toContain("USE rentals_dashboard");
+    expect(migration).not.toMatch(/information_schema/i);
     expect(migration).not.toMatch(/(?:^|;)\s*(?:DROP|TRUNCATE|DELETE|ALTER)\b/im);
     expect(migration).not.toMatch(/whatsapp/i);
   });
 
   it("keeps the verification script read-only", () => {
     const verification = withoutComments(readSql("002_verify_notification_only.sql"));
-    expect(verification).toMatch(/^\s*SELECT/i);
+    expect(verification).toMatch(/^\s*USE rentals_dashboard;/i);
+    expect(verification).toContain("SHOW TABLES LIKE 'browser_notification_state'");
+    expect(verification).not.toMatch(/information_schema/i);
     expect(verification).not.toMatch(/\b(?:INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|REPLACE)\b/i);
   });
 });
