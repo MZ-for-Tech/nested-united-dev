@@ -2039,8 +2039,12 @@ export function AnalyticsDashboardClient({
                   // Calculate average occupancy
                   const avgOccupancy = Math.round(list.reduce((sum: number, u: any) => sum + u.occupancyVal, 0) / list.length);
 
+                  // Total CRM pipeline value across all units
+                  const totalCrmPipeline = list.reduce((sum: number, u: any) => sum + (u.crmPipelineVal || 0), 0);
+                  const totalCrmWon = list.reduce((sum: number, u: any) => sum + (u.crmRevenueVal || 0), 0);
+
                   return (
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-5">
                       {/* Top Earning Unit Card */}
                       <div className="bg-gradient-to-br from-indigo-50/40 to-indigo-50/10 border border-indigo-100/70 rounded-2xl p-5 space-y-3 relative overflow-hidden shadow-sm">
                         <div className="flex items-center justify-between">
@@ -2085,6 +2089,21 @@ export function AnalyticsDashboardClient({
                           </div>
                         </div>
                       </div>
+
+                      {/* CRM Pipeline Card */}
+                      <div className="bg-gradient-to-br from-violet-50/40 to-violet-50/10 border border-violet-100/70 rounded-2xl p-5 space-y-3 relative overflow-hidden shadow-sm">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-bold text-violet-700 bg-violet-50 px-2.5 py-1 rounded-lg">إيرادات CRM للوحدات</span>
+                          <Briefcase className="w-5 h-5 text-violet-500" />
+                        </div>
+                        <div className="space-y-0.5">
+                          <h4 className="text-base font-black text-gray-800">صفقات مؤكدة + Pipeline</h4>
+                          <div className="flex flex-col gap-0.5">
+                            <span className="text-lg font-black text-violet-600">{totalCrmWon.toLocaleString("en-US")} ر.س <span className="text-[10px] font-bold text-gray-400">مؤكد</span></span>
+                            <span className="text-xs font-bold text-violet-400">{totalCrmPipeline.toLocaleString("en-US")} ر.س توقعات</span>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   );
                 })()}
@@ -2123,9 +2142,11 @@ export function AnalyticsDashboardClient({
                                 {renderSortHeader("occupancy", "نسبة الإشغال")}
                                 {renderSortHeader("adr", "سعر الليلة (ADR)")}
                                 {renderSortHeader("revpar", "العائد المتاح (RevPAR)")}
-                                {renderSortHeader("revenue", "إجمالي الإيراد")}
-                                {renderSortHeader("cost", "التكاليف التقديرية")}
-                                {renderSortHeader("profit", "صافي الأرباح")}
+                                {renderSortHeader("revenue", "إجمالي الإيراد (حجوزات + CRM)")}
+                                <th className="px-4 py-4 text-right text-violet-600">CRM صفقات مؤكدة</th>
+                                <th className="px-4 py-4 text-right text-violet-400">Pipeline CRM</th>
+                                {renderSortHeader("cost", "حصة المستثمر")}
+                                {renderSortHeader("profit", "صافي الأرباح (الشركة)")}
                                 {renderSortHeader("margin", "هامش الربح", true)}
                               </>
                             );
@@ -2154,7 +2175,7 @@ export function AnalyticsDashboardClient({
                           if (sorted.length === 0) {
                             return (
                               <tr>
-                                <td colSpan={8} className="px-5 py-8 text-center text-gray-400">
+                                <td colSpan={10} className="px-5 py-8 text-center text-gray-400">
                                   لا توجد نتائج مطابقة لبحثك.
                                 </td>
                               </tr>
@@ -2163,7 +2184,16 @@ export function AnalyticsDashboardClient({
 
                           return sorted.map((row: any, idx: number) => (
                             <tr key={idx} className="hover:bg-gray-50/50 transition-colors">
-                              <td className="px-4 py-4 font-bold text-gray-900">{row.name}</td>
+                              <td className="px-4 py-4 font-bold text-gray-900">
+                                <div className="flex flex-col gap-0.5">
+                                  <span>{row.name}</span>
+                                  {row.profitSharePct !== undefined && (
+                                    <span className="text-[10px] font-bold text-gray-400">
+                                      الشركة {row.profitSharePct}% · المستثمر {row.investorPct || 0}%
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
 
                               {/* Occupancy Rate Column */}
                               <td className="px-4 py-4">
@@ -2182,12 +2212,50 @@ export function AnalyticsDashboardClient({
                               <td className="px-4 py-4 text-gray-700">{row.adr}</td>
                               <td className="px-4 py-4 text-gray-500">{row.revpar}</td>
 
-                              <td className="px-4 py-4 text-gray-900">{row.revenue}</td>
+                              {/* Total Revenue (Bookings + CRM) */}
+                              <td className="px-4 py-4">
+                                <div className="flex flex-col gap-0.5">
+                                  <span className="font-bold text-gray-900">{row.revenue}</span>
+                                  {(row.bookingRevenueVal > 0 || row.crmRevenueVal > 0) && (
+                                    <span className="text-[10px] text-gray-400 font-bold">
+                                      حجوزات: {row.bookingRevenue}
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+
+                              {/* CRM Won Deals */}
+                              <td className="px-4 py-4">
+                                {(row.crmRevenueVal || 0) > 0 ? (
+                                  <div className="flex flex-col gap-0.5">
+                                    <span className="font-bold text-violet-700">{row.crmRevenue}</span>
+                                    <span className="text-[10px] text-violet-400 font-bold">{row.crmWonCount || 0} صفقة مؤكدة</span>
+                                  </div>
+                                ) : (
+                                  <span className="text-gray-300 text-xs">—</span>
+                                )}
+                              </td>
+
+                              {/* CRM Pipeline */}
+                              <td className="px-4 py-4">
+                                {(row.crmPipelineVal || 0) > 0 ? (
+                                  <span className="font-semibold text-violet-400">{row.crmPipeline}</span>
+                                ) : (
+                                  <span className="text-gray-300 text-xs">—</span>
+                                )}
+                              </td>
+
+                              {/* Investor Payout */}
                               <td className="px-4 py-4 text-rose-600">{row.cost}</td>
+
+                              {/* Net Profit */}
                               <td className="px-4 py-4 text-emerald-600 font-bold">{row.profit}</td>
+
+                              {/* Margin Badge */}
                               <td className="px-4 py-4 text-left">
-                                <span className={`px-2.5 py-1 rounded-lg text-xs font-bold ${row.status === "high" ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"
-                                  }`}>
+                                <span className={`px-2.5 py-1 rounded-lg text-xs font-bold ${
+                                  row.status === "high" ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"
+                                }`}>
                                   {row.margin}
                                 </span>
                               </td>

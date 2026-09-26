@@ -1,20 +1,35 @@
+// ============================================================
+// Analytics API Route — Orchestrator
+// All heavy query logic is delegated to _lib/queries/*.queries.ts
+// ============================================================
 import { NextRequest, NextResponse } from "next/server";
-import { query, queryOne } from "@/lib/db";
+import { query } from "@/lib/db";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/app/api/auth/[...nextauth]/route";
 import { getCacheKey, analyticsCache, CACHE_TTL, clearAnalyticsCache } from "@/lib/analytics-cache";
+
+// Utilities
+import { resolveDateRange, formatDate, getISOWeekNumber } from "./_lib/date-utils";
+import { buildAccountFilters } from "./_lib/account-filter";
+
+// Query modules
+import { fetchRevenueKPIs, fetchPlatformShare, fetchBookingKPIs, getPeriodRevenue, getPeriodOccupiedDays } from "./_lib/queries/revenue.queries";
+import { fetchEmployees, calculatePayrollForPeriod, fetchInvestorPayouts, fetchMainExpenses, getPeriodExpenses } from "./_lib/queries/expenses.queries";
+import { fetchCrmKPIs, fetchCrmPipeline, fetchRecentDeals } from "./_lib/queries/crm.queries";
+import { fetchHRPayroll, fetchAttendanceReport, fetchHRMiscData } from "./_lib/queries/hr.queries";
+import { fetchMaintenanceCount, fetchMaintenanceAnalytics, fetchInvoiceAnalytics } from "./_lib/queries/maintenance.queries";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   try {
-    // 1. Authenticate user session
+    // ── 1. Auth ────────────────────────────────────────────
     const session = await getServerSession(authOptions);
     if (!session?.user) {
       return NextResponse.json({ error: "غير مصرح بالدخول" }, { status: 401 });
     }
 
-    // 2. Parse query parameters
+    // ── 2. Parse params ────────────────────────────────────
     const { searchParams } = new URL(req.url);
     const account = searchParams.get("account") || "all";
     const range = searchParams.get("range") || "month";
@@ -22,702 +37,209 @@ export async function GET(req: NextRequest) {
     const customEndDate = searchParams.get("endDate") || "";
     const bypass = searchParams.get("bypass") === "true";
 
-    // 2.5 Check Server-Side Cache
+    // ── 3. Cache check ─────────────────────────────────────
     const cacheKey = getCacheKey(account, range, customStartDate, customEndDate);
     if (bypass) {
       clearAnalyticsCache();
     } else {
       const cached = analyticsCache.get(cacheKey);
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-        console.log(`[Analytics API] Cache Hit for key: ${cacheKey}`);
         return NextResponse.json(cached.data);
       }
     }
-    console.log(`[Analytics API] Cache Miss / Bypass for key: ${cacheKey}`);
 
-    // 3. Determine Date Range
-    const now = new Date();
-    const format = (d: Date) => {
-      const year = d.getFullYear();
-      const month = String(d.getMonth() + 1).padStart(2, "0");
-      const day = String(d.getDate()).padStart(2, "0");
-      return `${year}-${month}-${day}`;
-    };
-    const getISOWeekNumber = (date: Date): number => {
-      const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-      const dayNum = d.getUTCDay() || 7;
-      d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-      const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-      return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
-    };
-    // Fetch max database date to support Year-to-Date (YTD) capping
-    const maxBookingsResult = await query<any>("SELECT MAX(checkout_date) as max_d FROM bookings");
-    const maxReservationsResult = await query<any>("SELECT MAX(end_date) as max_d FROM reservations");
-    const bMaxVal = maxBookingsResult[0]?.max_d;
-    const rMaxVal = maxReservationsResult[0]?.max_d;
-    const maxDates: Date[] = [];
-    if (bMaxVal) maxDates.push(new Date(bMaxVal));
-    if (rMaxVal) maxDates.push(new Date(rMaxVal));
-    const maxDataDate = maxDates.length > 0 ? new Date(Math.max(...maxDates.map(d => d.getTime()))) : null;
+    // ── 4. Resolve date range ──────────────────────────────
+    const { startDateStr, endDateStr, daysCount } = await resolveDateRange(range, customStartDate, customEndDate);
+    console.log("[Analytics] Dates:", { startDateStr, endDateStr, daysCount });
 
-    // Fetch min database date to support Year-to-Date (YTD) start-capping
-    const minBookingsResult = await query<any>("SELECT MIN(checkin_date) as min_d FROM bookings");
-    const minReservationsResult = await query<any>("SELECT MIN(start_date) as min_d FROM reservations");
-    const bMinVal = minBookingsResult[0]?.min_d;
-    const rMinVal = minReservationsResult[0]?.min_d;
-    const minDates: Date[] = [];
-    if (bMinVal) minDates.push(new Date(bMinVal));
-    if (rMinVal) minDates.push(new Date(rMinVal));
-    const minDataDate = minDates.length > 0 ? new Date(Math.min(...minDates.map(d => d.getTime()))) : null;
+    // ── 5. Build account filters ───────────────────────────
+    const filters = buildAccountFilters(account, startDateStr, endDateStr);
+    const {
+      accountFilterBookings, accountFilterReservations, accountFilterUnits,
+      paramsBookings, paramsReservations, paramsOccupancyBookings, paramsOccupancyReservations,
+      paramsUnits, accountIds,
+    } = filters;
 
-    let startDateStr = "";
-    let endDateStr = "";
+    // ── 6. Revenue KPIs ────────────────────────────────────
+    const { totalRevenue, bookingsDays, reservationsDays, totalBookedDays, totalUnits } =
+      await fetchRevenueKPIs(
+        startDateStr, endDateStr,
+        accountFilterBookings, accountFilterReservations, accountFilterUnits,
+        paramsOccupancyBookings, paramsOccupancyReservations, paramsUnits
+      );
 
-    if (range === "all") {
-      if (minDataDate && maxDataDate) {
-        startDateStr = format(minDataDate);
-        endDateStr = format(maxDataDate);
-      } else {
-        startDateStr = "2025-01-01";
-        endDateStr = "2026-12-31";
-      }
-    } else if (customStartDate && customEndDate) {
-      startDateStr = customStartDate;
-      endDateStr = customEndDate;
-    } else {
-      if (range === "today") {
-        startDateStr = format(now);
-        endDateStr = format(now);
-      } else if (range === "week") {
-        const startOfWeek = new Date(now);
-        const day = now.getDay(); // 0 is Sunday, 1 is Monday, ...
-        const diff = day === 0 ? 6 : day - 1;
-        startOfWeek.setDate(now.getDate() - diff);
-        const endOfWeek = new Date(startOfWeek);
-        endOfWeek.setDate(startOfWeek.getDate() + 6);
-        startDateStr = format(startOfWeek);
-        endDateStr = format(endOfWeek);
-      } else if (range === "month") {
-        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-        const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        startDateStr = format(startOfMonth);
-        endDateStr = format(endOfMonth);
-      } else if (range === "quarter") {
-        const currentQuarter = Math.floor(now.getMonth() / 3);
-        const startOfQuarter = new Date(now.getFullYear(), currentQuarter * 3, 1);
-        const endOfQuarter = new Date(now.getFullYear(), (currentQuarter + 1) * 3, 0);
-        startDateStr = format(startOfQuarter);
-        endDateStr = format(endOfQuarter);
-      } else if (range === "year") {
-        const startOfYear = new Date(now.getFullYear(), 0, 1);
-        const endOfYear = new Date(now.getFullYear(), 11, 31);
-        startDateStr = format(startOfYear);
-        endDateStr = format(endOfYear);
-      } else {
-        // Default to start of current month
-        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-        const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-        startDateStr = format(startOfMonth);
-        endDateStr = format(endOfMonth);
-      }
-    }
-
-    // Apply YTD capping (Start Date)
-    console.log("[Analytics Debug] Capping input dates:", { startDateStr, endDateStr, minDataDate: minDataDate ? format(minDataDate) : null, maxDataDate: maxDataDate ? format(maxDataDate) : null });
-    if (minDataDate) {
-      const startD = new Date(startDateStr);
-      const endD = new Date(endDateStr);
-      if (minDataDate > startD && minDataDate <= endD) {
-        startDateStr = format(minDataDate);
-        console.log("[Analytics Debug] Start date capped to:", startDateStr);
-      }
-    }
-
-    // Apply YTD capping (End Date)
-    if (maxDataDate) {
-      const startD = new Date(startDateStr);
-      const endD = new Date(endDateStr);
-      if (maxDataDate >= startD && maxDataDate < endD) {
-        endDateStr = format(maxDataDate);
-        console.log("[Analytics Debug] End date capped to:", endDateStr);
-      }
-    }
-
-    const daysCount = Math.max(
-      1,
-      Math.ceil((new Date(endDateStr).getTime() - new Date(startDateStr).getTime()) / (1000 * 60 * 60 * 24)) + 1
-    );
-    console.log("[Analytics Debug] Final dates used:", { startDateStr, endDateStr, daysCount });
-
-    // Build filter query strings
-    let accountFilterReservations = "";
-    let accountFilterBookings = "";
-    let accountFilterUnits = "";
-    const paramsReservations: unknown[] = [startDateStr, endDateStr];
-    const paramsBookings: unknown[] = [startDateStr, endDateStr];
-    const paramsOccupancyReservations: unknown[] = [endDateStr, startDateStr, endDateStr, startDateStr];
-    const paramsOccupancyBookings: unknown[] = [endDateStr, startDateStr, endDateStr, startDateStr];
-    const paramsUnits: unknown[] = [];
-
-    if (account !== "all") {
-      const accountIds = account.split(",");
-      const placeholders = accountIds.map(() => "?").join(",");
-      accountFilterReservations = ` AND u.platform_account_id IN (${placeholders}) `;
-      accountFilterBookings = ` AND u.platform_account_id IN (${placeholders}) `;
-      accountFilterUnits = ` AND u.platform_account_id IN (${placeholders}) `;
-      paramsReservations.push(...accountIds);
-      paramsBookings.push(...accountIds);
-      paramsOccupancyReservations.push(...accountIds);
-      paramsOccupancyBookings.push(...accountIds);
-      paramsUnits.push(...accountIds);
-    }
-
-    // 4. Calculate Revenue (Strictly from Confirmed Bookings)
-    const bookingsRevenueResult = await query<{ revenue: number | string }>(
-      `SELECT SUM(
-         (b.amount / COALESCE(NULLIF(DATEDIFF(b.checkout_date, b.checkin_date), 0), 1)) *
-         GREATEST(0, DATEDIFF(
-           LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-           GREATEST(b.checkin_date, ?)
-         ) + 1)
-       ) as revenue
-       FROM bookings b
-       INNER JOIN units u ON b.unit_id = u.id
-       WHERE b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}`,
-      paramsOccupancyBookings
-    );
-    const bookingsRevenue = Number(bookingsRevenueResult[0]?.revenue || 0);
-
-    const totalRevenue = bookingsRevenue;
-
-    // 5. Calculate Occupied / Booked Days
-    // A. iCal occupied days
-    const reservationsDaysResult = await query<{ days: number | string }>(
-      `SELECT SUM(GREATEST(0, DATEDIFF(
-         LEAST(CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END, ?),
-         GREATEST(r.start_date, ?)
-       ) + 1)) as days
-       FROM reservations r
-       INNER JOIN units u ON r.unit_id = u.id
-       WHERE r.start_date <= ? AND (CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END) >= ? ${accountFilterReservations}`,
-      paramsOccupancyReservations
-    );
-    const reservationsDays = Number(reservationsDaysResult[0]?.days || 0);
-
-    // B. Manual bookings occupied days
-    const bookingsDaysResult = await query<{ days: number | string }>(
-      `SELECT SUM(GREATEST(0, DATEDIFF(
-         LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-         GREATEST(b.checkin_date, ?)
-       ) + 1)) as days
-       FROM bookings b
-       INNER JOIN units u ON b.unit_id = u.id
-       WHERE b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}`,
-      paramsOccupancyBookings
-    );
-    const bookingsDays = Number(bookingsDaysResult[0]?.days || 0);
-
-    const totalBookedDays = reservationsDays + bookingsDays;
-
-    // 6. Calculate Total Units count
-    const totalUnitsResult = await query<{ count: number }>(
-      `SELECT COUNT(*) as count FROM units u WHERE u.status = 'active' ${accountFilterUnits}`,
-      paramsUnits
-    );
-    const totalUnits = Math.max(1, totalUnitsResult[0]?.count || 1);
-
-    // 7. Calculate KPI rates
     const totalAvailableDays = totalUnits * daysCount;
     const occupancyRate = Number(((totalBookedDays / totalAvailableDays) * 100).toFixed(1));
     const adr = bookingsDays > 0 ? Math.round(totalRevenue / bookingsDays) : 0;
     const revpar = Math.round(adr * (occupancyRate / 100));
 
-    // --- Start Additional KPIs ---
-    const paramsSimpleBookings = [endDateStr, startDateStr];
-    const paramsSimpleReservations = [endDateStr, startDateStr];
-    if (account !== "all") {
-      const accountIds = account.split(",");
-      paramsSimpleBookings.push(...accountIds);
-      paramsSimpleReservations.push(...accountIds);
-    }
+    // ── 7. Platform share ──────────────────────────────────
+    const platformShare = await fetchPlatformShare(totalRevenue, accountFilterBookings, paramsOccupancyBookings);
 
-    // Count bookings:
-    const bookingsCountResult = await query<{ count: number }>(
-      `SELECT COUNT(*) as count FROM bookings b
-       INNER JOIN units u ON b.unit_id = u.id
-       WHERE b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}`,
-      paramsSimpleBookings
-    );
-    const bookingsCount = Number(bookingsCountResult[0]?.count || 0);
+    // ── 8. Booking counts + repeat guest rate ──────────────
+    const { totalBookingsCount, repeatGuestRate, paramsSimpleBookings } =
+      await fetchBookingKPIs(endDateStr, startDateStr, accountIds, accountFilterBookings, accountFilterReservations);
 
-    // Count reservations:
-    const reservationsCountResult = await query<{ count: number }>(
-      `SELECT COUNT(*) as count FROM reservations r
-       INNER JOIN units u ON r.unit_id = u.id
-       WHERE r.start_date <= ? AND (CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END) >= ? ${accountFilterReservations}`,
-      paramsSimpleReservations
-    );
-    const reservationsCount = Number(reservationsCountResult[0]?.count || 0);
-
-    const totalBookingsCount = bookingsCount + reservationsCount;
-
-    // Maintenance Tickets resolved in the period
-    const maintenanceCountResult = await query<{ count: number }>(
-      `SELECT COUNT(*) as count FROM maintenance_tickets mt
-       INNER JOIN units u ON mt.unit_id = u.id
-       WHERE mt.status = 'resolved' 
-         AND mt.created_at >= ? AND mt.created_at <= ?
-         ${accountFilterUnits}`,
-      [startDateStr, endDateStr, ...paramsUnits]
-    );
-    const maintenanceCount = Number(maintenanceCountResult[0]?.count || 0);
-    const maintenanceExpenses = maintenanceCount * 0;
-    const operatingExpenses = totalBookingsCount * 0;
-
-    // Vendor Bills in the period
-    const invoicesResult = await query<{ total: number | string }>(
-      `SELECT SUM(total_amount) as total FROM accounting_invoices 
-       WHERE invoice_type = 'vendor_bill' AND deleted_at IS NULL
-         AND invoice_date >= ? AND invoice_date <= ?`,
-      [startDateStr, endDateStr]
-    );
-    const vendorBills = Number(invoicesResult[0]?.total || 0);
-
-    // HR payroll - Fetched and calculated dynamically by hire_date
-    interface EmployeeRow {
-      basic_salary: number | string;
-      housing_allowance: number | string;
-      transport_allowance: number | string;
-      other_allowances: number | string;
-      hire_date: string | null;
-      salary_currency: string | null;
-    }
-    const employees = await query<EmployeeRow>(
-      `SELECT basic_salary, housing_allowance, transport_allowance, other_allowances, hire_date, salary_currency 
-       FROM hr_employees 
-       WHERE status = 'active' AND exclude_from_payroll = 0`
-    );
-
-    const calculatePayrollForPeriod = (startStr: string, endStr: string) => {
-      const start = new Date(startStr);
-      const end = new Date(endStr);
-      let totalPayroll = 0;
-
-      for (const emp of employees) {
-        const hireDate = emp.hire_date ? new Date(emp.hire_date) : null;
-        if (hireDate && hireDate > end) {
-          continue;
-        }
-
-        const currency = emp.salary_currency || 'SAR';
-        if (currency.toUpperCase() === 'EGP') {
-          continue; // Skip Egyptian employees, accountant handles them manually in SAR
-        }
-
-        const basic = Number(emp.basic_salary || 0);
-        const allowances = Number(emp.housing_allowance || 0) + 
-                           Number(emp.transport_allowance || 0) + 
-                           Number(emp.other_allowances || 0);
-
-        const deductions = Math.round(basic * 0.02);
-        const monthlyNet = basic + allowances - deductions;
-
-        if (!hireDate || hireDate <= start) {
-          const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1);
-          totalPayroll += (monthlyNet / 30) * days;
-        } else {
-          const days = Math.max(1, Math.ceil((end.getTime() - hireDate.getTime()) / (1000 * 60 * 60 * 24)) + 1);
-          totalPayroll += (monthlyNet / 30) * days;
-        }
-      }
-      return Math.round(totalPayroll);
-    };
-
-    // Total active units count company-wide
+    // ── 9. Employees (needed for payroll & expenses) ───────
+    const employees = await fetchEmployees();
     const totalUnitsCountResult = await query<{ count: number }>("SELECT COUNT(*) as count FROM units WHERE status = 'active'");
     const totalUnitsCount = Number(totalUnitsCountResult[0]?.count || 24);
 
-    const allocatedPayroll = totalUnitsCount > 0 ? (totalUnits / totalUnitsCount) * calculatePayrollForPeriod(startDateStr, endDateStr) : 0;
-    const allocatedInvoices = totalUnitsCount > 0 ? (totalUnits / totalUnitsCount) * vendorBills : 0;
+    // ── 10. Maintenance count (for expense calc) ───────────
+    const maintenanceCount = await fetchMaintenanceCount(startDateStr, endDateStr, accountFilterUnits, paramsUnits);
 
-    const getInvestorPayouts = async (startStr: string, endStr: string) => {
-      const p = [endStr, startStr, endStr, startStr];
-      const accountIds = account !== "all" ? account.split(",") : [];
-      if (account !== "all") {
-        p.push(...accountIds);
-      }
-      
-      const rows = await query<any>(
-        `SELECT 
-            b.unit_id,
-            SUM(
-              (b.amount / COALESCE(NULLIF(DATEDIFF(b.checkout_date, b.checkin_date), 0), 1)) *
-              GREATEST(0, DATEDIFF(
-                LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-                GREATEST(b.checkin_date, ?)
-              ) + 1)
-            ) as unit_revenue,
-            u.profit_share,
-            inv.default_profit_share
-         FROM bookings b
-         INNER JOIN units u ON b.unit_id = u.id
-         LEFT JOIN investors inv ON u.investor_id = inv.id
-         WHERE b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ?
-         ${accountFilterBookings}
-         GROUP BY b.unit_id, u.profit_share, inv.default_profit_share`,
-        p
-      );
-
-      let totalPayout = 0;
-      for (const row of rows) {
-        const rev = Number(row.unit_revenue || 0);
-        const companyPct = row.profit_share !== null 
-          ? Number(row.profit_share) 
-          : (row.default_profit_share !== null ? Number(row.default_profit_share) : 100);
-        
-        const investorPct = Math.max(0, 100 - companyPct);
-        totalPayout += rev * (investorPct / 100);
-      }
-      return Math.round(totalPayout);
-    };
-
-    const mainInvestorPayouts = await getInvestorPayouts(startDateStr, endDateStr);
-
-    const totalExpenses = Math.round(operatingExpenses + maintenanceExpenses + allocatedPayroll + allocatedInvoices + mainInvestorPayouts);
+    // ── 11. Expenses ───────────────────────────────────────
+    const { totalExpenses } = await fetchMainExpenses({
+      startDateStr, endDateStr,
+      totalBookingsCount, maintenanceCount,
+      totalUnits, totalUnitsCount,
+      employees, accountIds, accountFilterBookings,
+    });
     const netIncome = totalRevenue - totalExpenses;
 
-    // Helpers for dynamic period analytics (Cashflow & Occupancy trends)
-    const getPeriodRevenue = async (startStr: string, endStr: string) => {
-      const p = [endStr, startStr, endStr, startStr];
-      const accountIds = account !== "all" ? account.split(",") : [];
-      if (account !== "all") {
-        p.push(...accountIds);
-      }
-      const res = await query<{ revenue: number | string }>(
-        `SELECT SUM(
-           (b.amount / COALESCE(NULLIF(DATEDIFF(b.checkout_date, b.checkin_date), 0), 1)) *
-           GREATEST(0, DATEDIFF(
-             LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-             GREATEST(b.checkin_date, ?)
-           ) + 1)
-         ) as revenue
-         FROM bookings b
-         INNER JOIN units u ON b.unit_id = u.id
-         WHERE b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}`,
-        p
-      );
-      return Number(res[0]?.revenue || 0);
-    };
-
-    const getPeriodOccupiedDays = async (startStr: string, endStr: string) => {
-      const p = [endStr, startStr, endStr, startStr];
-      const accountIds = account !== "all" ? account.split(",") : [];
-      if (account !== "all") {
-        p.push(...accountIds);
-      }
-      
-      const resB = await query<{ days: number | string }>(
-        `SELECT SUM(GREATEST(0, DATEDIFF(
-           LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-           GREATEST(b.checkin_date, ?)
-         ) + 1)) as days
-         FROM bookings b
-         INNER JOIN units u ON b.unit_id = u.id
-         WHERE b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}`,
-        p
-      );
-      
-      const resR = await query<{ days: number | string }>(
-        `SELECT SUM(GREATEST(0, DATEDIFF(
-           LEAST(CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END, ?),
-           GREATEST(r.start_date, ?)
-         ) + 1)) as days
-         FROM reservations r
-         INNER JOIN units u ON r.unit_id = u.id
-         WHERE r.start_date <= ? AND (CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END) >= ? ${accountFilterReservations}`,
-        p
-      );
-      
-      return Number(resB[0]?.days || 0) + Number(resR[0]?.days || 0);
-    };
-
-    const getPeriodExpenses = async (startStr: string, endStr: string, daysInPeriod: number) => {
-      const pCount = [endStr, startStr];
-      const accountIds = account !== "all" ? account.split(",") : [];
-      if (account !== "all") {
-        pCount.push(...accountIds);
-      }
-
-      // Count bookings
-      const bCountRes = await query<{ count: number }>(
-        `SELECT COUNT(*) as count FROM bookings b
-         INNER JOIN units u ON b.unit_id = u.id
-         WHERE b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}`,
-        pCount
-      );
-      const bCount = Number(bCountRes[0]?.count || 0);
-
-      // Count reservations
-      const rCountRes = await query<{ count: number }>(
-        `SELECT COUNT(*) as count FROM reservations r
-         INNER JOIN units u ON r.unit_id = u.id
-         WHERE r.start_date <= ? AND (CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END) >= ? ${accountFilterReservations}`,
-        pCount
-      );
-      const rCount = Number(rCountRes[0]?.count || 0);
-      
-      const totalBookingsVal = bCount + rCount;
-      const opExpenses = totalBookingsVal * 0;
-
-      // Maintenance resolved
-      const pMaint = [startStr, endStr];
-      if (account !== "all") {
-        pMaint.push(...accountIds);
-      }
-      const maintRes = await query<{ count: number }>(
-        `SELECT COUNT(*) as count FROM maintenance_tickets mt
-         INNER JOIN units u ON mt.unit_id = u.id
-         WHERE mt.status = 'resolved' 
-           AND mt.created_at >= ? AND mt.created_at <= ?
-           ${accountFilterUnits}`,
-        pMaint
-      );
-      const maintCount = Number(maintRes[0]?.count || 0);
-      const maintExpenses = maintCount * 0;
-
-      // Vendor Bills
-      const invoicesRes = await query<{ total: number | string }>(
-        `SELECT SUM(total_amount) as total FROM accounting_invoices 
-         WHERE invoice_type = 'vendor_bill' AND deleted_at IS NULL
-           AND invoice_date >= ? AND invoice_date <= ?`,
-        [startStr, endStr]
-      );
-      const vendorBillsVal = Number(invoicesRes[0]?.total || 0);
-
-      // Payroll overhead allocated
-      const periodPayroll = calculatePayrollForPeriod(startStr, endStr);
-      const allocPayroll = totalUnitsCount > 0 ? (totalUnits / totalUnitsCount) * periodPayroll : 0;
-      const allocInvoices = totalUnitsCount > 0 ? (totalUnits / totalUnitsCount) * vendorBillsVal : 0;
-
-      const subInvestorPayouts = await getInvestorPayouts(startStr, endStr);
-
-      return Math.round(opExpenses + maintExpenses + allocPayroll + allocInvoices + subInvestorPayouts);
-    };
-
-    // Repeat Guest Rate
-    const repeatGuestsResult = await query<{ repeated: number; total_unique: number }>(
-      `SELECT 
-         COUNT(DISTINCT CASE WHEN booking_count > 1 THEN guest_key END) as repeated,
-         COUNT(DISTINCT guest_key) as total_unique
-       FROM (
-         SELECT COALESCE(NULLIF(b.phone, ''), b.guest_name) as guest_key, COUNT(*) as booking_count
-         FROM bookings b
-         INNER JOIN units u ON b.unit_id = u.id
-         WHERE b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}
-         GROUP BY COALESCE(NULLIF(b.phone, ''), b.guest_name)
-       ) as guest_bookings`,
-      paramsSimpleBookings
-    );
-    const repeatedCount = Number(repeatGuestsResult[0]?.repeated || 0);
-    const totalUniqueCount = Number(repeatGuestsResult[0]?.total_unique || 0);
-    const repeatGuestRate = totalUniqueCount > 0 ? Number(((repeatedCount / totalUniqueCount) * 100).toFixed(1)) : 0.0;
-    // --- End Additional KPIs ---
-
-    const airbnbRevenueResult = await query<{ revenue: number | string }>(
-      `SELECT SUM(
-         (b.amount / COALESCE(NULLIF(DATEDIFF(b.checkout_date, b.checkin_date), 0), 1)) *
-         GREATEST(0, DATEDIFF(
-           LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-           GREATEST(b.checkin_date, ?)
-         ) + 1)
-       ) as revenue
-       FROM bookings b
-       INNER JOIN units u ON b.unit_id = u.id
-       WHERE b.platform = 'airbnb' AND b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}`,
-      paramsOccupancyBookings
-    );
-    const airbnbRevenue = Number(airbnbRevenueResult[0]?.revenue || 0);
-
-    const gathernRevenueResult = await query<{ revenue: number | string }>(
-      `SELECT SUM(
-         (b.amount / COALESCE(NULLIF(DATEDIFF(b.checkout_date, b.checkin_date), 0), 1)) *
-         GREATEST(0, DATEDIFF(
-           LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-           GREATEST(b.checkin_date, ?)
-         ) + 1)
-       ) as revenue
-       FROM bookings b
-       INNER JOIN units u ON b.unit_id = u.id
-       WHERE b.platform = 'gathern' AND b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ? ${accountFilterBookings}`,
-      paramsOccupancyBookings
-    );
-    const gathernRevenue = Number(gathernRevenueResult[0]?.revenue || 0);
-
-    const platformShare = {
-      airbnb: airbnbRevenue,
-      gathern: gathernRevenue,
-      external: Math.max(0, totalRevenue - (airbnbRevenue + gathernRevenue)),
-    };
-
-    // 9. Dynamic Revenue Growth Trend (Daily/Weekly/Monthly)
-    const monthlyData: { month: string; amount: number; expenses: number; occupancy: number; percentage: string }[] = [];
-    const sDate = new Date(startDateStr);
+    // ── 12. Cashflow & Occupancy Trend ─────────────────────
     const eDate = new Date(endDateStr);
+    const monthlyData: { month: string; amount: number; expenses: number; occupancy: number; percentage: string }[] = [];
+
+    const periodRevenueOpts = { accountIds, accountFilterBookings, accountFilterReservations };
+    const periodExpensesOpts = {
+      accountIds, accountFilterBookings, accountFilterReservations, accountFilterUnits,
+      totalUnits, totalUnitsCount, employees,
+    };
 
     if (range === "today") {
-      // Show daily trend centered around the selected eDate (-3 days to +3 days)
       const arabicDayNames = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
       for (let i = -3; i <= 3; i++) {
         const targetDay = new Date(eDate);
         targetDay.setDate(eDate.getDate() + i);
-        const dayStr = format(targetDay);
-
-        const dRevenue = await getPeriodRevenue(dayStr, dayStr);
-        const dOccupied = await getPeriodOccupiedDays(dayStr, dayStr);
-        const dOccupancy = Number(((dOccupied / totalUnits) * 100).toFixed(1));
-        const dExpenses = await getPeriodExpenses(dayStr, dayStr, 1);
-        const dayNum = targetDay.getDate();
-        const monthNum = targetDay.getMonth() + 1;
-        const dayName = arabicDayNames[targetDay.getDay()];
-        
+        const dayStr = formatDate(targetDay);
+        const [dRevenue, dOccupied, dExpenses] = await Promise.all([
+          getPeriodRevenue(dayStr, dayStr, accountIds, accountFilterBookings),
+          getPeriodOccupiedDays(dayStr, dayStr, accountIds, accountFilterBookings, accountFilterReservations),
+          getPeriodExpenses({ startStr: dayStr, endStr: dayStr, ...periodExpensesOpts }),
+        ]);
         monthlyData.push({
-          month: `${dayName} ${dayNum}/${monthNum}`,
+          month: `${arabicDayNames[targetDay.getDay()]} ${targetDay.getDate()}/${targetDay.getMonth() + 1}`,
           amount: dRevenue,
           expenses: dExpenses,
-          occupancy: dOccupancy,
+          occupancy: Number(((dOccupied / totalUnits) * 100).toFixed(1)),
           percentage: `${Math.min(100, Math.max(10, Math.round((dRevenue / (totalRevenue || 1)) * 100)))}%`,
         });
       }
     } else if (range === "week") {
-      // Show weekly trend for 10 weeks centered around the selected week of eDate (-5 weeks to +4 weeks)
       const selectedMonday = new Date(eDate);
       const dayVal = eDate.getDay();
-      const diffVal = dayVal === 0 ? 6 : dayVal - 1; // ISO Monday start
-      selectedMonday.setDate(eDate.getDate() - diffVal);
-
+      selectedMonday.setDate(eDate.getDate() - (dayVal === 0 ? 6 : dayVal - 1));
       for (let i = -5; i <= 4; i++) {
         const monday = new Date(selectedMonday);
         monday.setDate(selectedMonday.getDate() + i * 7);
-
         const sunday = new Date(monday);
         sunday.setDate(monday.getDate() + 6);
-
-        const startStr = format(monday);
-        const endStr = format(sunday);
-        const weekNum = getISOWeekNumber(monday);
-
-        const wRevenue = await getPeriodRevenue(startStr, endStr);
-        const wOccupied = await getPeriodOccupiedDays(startStr, endStr);
-        const wOccupancy = Number(((wOccupied / (totalUnits * 7)) * 100).toFixed(1));
-        const wExpenses = await getPeriodExpenses(startStr, endStr, 7);
-
+        const startStr = formatDate(monday);
+        const endStr = formatDate(sunday);
+        const [wRevenue, wOccupied, wExpenses] = await Promise.all([
+          getPeriodRevenue(startStr, endStr, accountIds, accountFilterBookings),
+          getPeriodOccupiedDays(startStr, endStr, accountIds, accountFilterBookings, accountFilterReservations),
+          getPeriodExpenses({ startStr, endStr, ...periodExpensesOpts }),
+        ]);
         monthlyData.push({
-          month: `أسبوع ${weekNum}`,
+          month: `أسبوع ${getISOWeekNumber(monday)}`,
           amount: wRevenue,
           expenses: wExpenses,
-          occupancy: wOccupancy,
+          occupancy: Number(((wOccupied / (totalUnits * 7)) * 100).toFixed(1)),
           percentage: `${Math.min(100, Math.max(10, Math.round((wRevenue / (totalRevenue || 1)) * 100)))}%`,
         });
       }
     } else {
-      // range === "month" || range === "year" || range === "custom"
-      // Show all 12 months of the year containing eDate (January to December)
       const targetYear = eDate.getFullYear();
       const monthNames = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"];
-
       for (let m = 0; m < 12; m++) {
-        // Start & end of target month
         const startOfMonthStr = `${targetYear}-${String(m + 1).padStart(2, "0")}-01`;
         const dateObj = new Date(targetYear, m + 1, 0);
         const endOfMonthStr = dateObj.toISOString().split("T")[0];
         const daysInMonth = dateObj.getDate();
-
-        const mRevenue = await getPeriodRevenue(startOfMonthStr, endOfMonthStr);
-        const mOccupied = await getPeriodOccupiedDays(startOfMonthStr, endOfMonthStr);
-        const mOccupancy = Number(((mOccupied / (totalUnits * daysInMonth)) * 100).toFixed(1));
-        const mExpenses = await getPeriodExpenses(startOfMonthStr, endOfMonthStr, daysInMonth);
-
+        const [mRevenue, mOccupied, mExpenses] = await Promise.all([
+          getPeriodRevenue(startOfMonthStr, endOfMonthStr, accountIds, accountFilterBookings),
+          getPeriodOccupiedDays(startOfMonthStr, endOfMonthStr, accountIds, accountFilterBookings, accountFilterReservations),
+          getPeriodExpenses({ startStr: startOfMonthStr, endStr: endOfMonthStr, ...periodExpensesOpts }),
+        ]);
         monthlyData.push({
           month: monthNames[m],
           amount: mRevenue,
           expenses: mExpenses,
-          occupancy: mOccupancy,
+          occupancy: Number(((mOccupied / (totalUnits * daysInMonth)) * 100).toFixed(1)),
           percentage: `${Math.min(100, Math.max(10, Math.round((mRevenue / (totalRevenue || 1)) * 100)))}%`,
         });
       }
     }
 
-    // 10. Live Unit Operations (Synced with Unit Readiness Page Logic)
+    // ── 13. Live Operations (Unit Readiness) ───────────────
     const calNow = new Date();
-    const todayStr = `${calNow.getFullYear()}-${String(calNow.getMonth() + 1).padStart(2, '0')}-${String(calNow.getDate()).padStart(2, '0')}`;
-    const currentMonthStart = `${calNow.getFullYear()}-${String(calNow.getMonth() + 1).padStart(2, '0')}-01`;
+    const todayStr = formatDate(calNow);
+    const currentMonthStart = `${calNow.getFullYear()}-${String(calNow.getMonth() + 1).padStart(2, "0")}-01`;
     const calLastDay = new Date(calNow.getFullYear(), calNow.getMonth() + 1, 0).getDate();
-    const currentMonthEnd = `${calNow.getFullYear()}-${String(calNow.getMonth() + 1).padStart(2, '0')}-${String(calLastDay).padStart(2, '0')}`;
+    const currentMonthEnd = `${calNow.getFullYear()}-${String(calNow.getMonth() + 1).padStart(2, "0")}-${String(calLastDay).padStart(2, "0")}`;
 
-    const activeBookings = await query<any>(
-      `SELECT unit_id, checkin_date as start_date, checkout_date as end_date FROM bookings
-       WHERE checkout_date >= ? AND checkin_date <= ?`,
-      [currentMonthStart, currentMonthEnd]
-    );
+    const [activeBookings, activeReservations, liveUnitsList] = await Promise.all([
+      query<any>(
+        `SELECT unit_id, checkin_date as start_date, checkout_date as end_date FROM bookings
+         WHERE checkout_date >= ? AND checkin_date <= ?`,
+        [currentMonthStart, currentMonthEnd]
+      ),
+      query<any>(
+        `SELECT unit_id, start_date, end_date FROM reservations
+         WHERE end_date >= ? AND start_date <= ?`,
+        [currentMonthStart, currentMonthEnd]
+      ),
+      query<any>(
+        `SELECT u.*,
+                (SELECT b.guest_name FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date = ? LIMIT 1) as manual_checkin_guest,
+                (SELECT r.summary FROM reservations r WHERE r.unit_id = u.id AND r.start_date = ? LIMIT 1) as ical_checkin_guest,
+                (SELECT b.guest_name FROM bookings b WHERE b.unit_id = u.id AND b.checkout_date = ? LIMIT 1) as manual_checkout_guest,
+                (SELECT r.summary FROM reservations r WHERE r.unit_id = u.id AND r.end_date = ? LIMIT 1) as ical_checkout_guest,
+                (SELECT b.checkin_date FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date = ? LIMIT 1) as manual_checkin_date,
+                (SELECT r.start_date FROM reservations r WHERE r.unit_id = u.id AND r.start_date = ? LIMIT 1) as ical_checkin_date,
+                (SELECT b.checkout_date FROM bookings b WHERE b.unit_id = u.id AND b.checkout_date = ? LIMIT 1) as manual_checkout_date,
+                (SELECT r.end_date FROM reservations r WHERE r.unit_id = u.id AND r.end_date = ? LIMIT 1) as ical_checkout_date,
+                (SELECT b.guest_name FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND b.checkout_date >= ? ORDER BY b.checkin_date DESC LIMIT 1) as active_manual_guest,
+                (SELECT r.summary FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= ? AND r.end_date >= ? ORDER BY r.start_date DESC LIMIT 1) as active_ical_guest,
+                (SELECT b.checkin_date FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND b.checkout_date >= ? ORDER BY b.checkin_date DESC LIMIT 1) as active_manual_checkin,
+                (SELECT r.start_date FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= ? AND r.end_date >= ? ORDER BY r.start_date DESC LIMIT 1) as active_ical_checkin,
+                (SELECT b.checkout_date FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND b.checkout_date >= ? ORDER BY b.checkin_date DESC LIMIT 1) as active_manual_checkout,
+                (SELECT r.end_date FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= ? AND r.end_date >= ? ORDER BY r.start_date DESC LIMIT 1) as active_ical_checkout,
+                (SELECT b.notes FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND b.checkout_date >= ? ORDER BY b.checkin_date DESC LIMIT 1) as active_manual_notes,
+                (SELECT platform FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= CURRENT_DATE() AND r.end_date >= CURRENT_DATE() LIMIT 1) as platform,
+                COALESCE((SELECT SUM(amount) FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date >= ? AND b.checkin_date <= ?), 0) as total_revenue,
+                (SELECT COUNT(*) FROM bookings b2 WHERE b2.unit_id = u.id AND b2.checkin_date >= ? AND b2.checkin_date <= ?) as bookings_count,
+                (SELECT COUNT(*) FROM maintenance_tickets mt WHERE mt.unit_id = u.id AND mt.status != 'resolved') as active_maint_tickets
+         FROM units u
+         WHERE u.status = 'active' ${accountFilterUnits}
+         ORDER BY u.unit_name ASC`,
+        [
+          todayStr, todayStr, todayStr, todayStr, todayStr, todayStr, todayStr, todayStr,
+          todayStr, todayStr, todayStr, todayStr, todayStr, todayStr,
+          todayStr, todayStr, todayStr, todayStr,
+          todayStr, todayStr, todayStr, todayStr,
+          startDateStr, endDateStr, startDateStr, endDateStr,
+          ...paramsUnits,
+        ]
+      ),
+    ]);
 
-    const activeReservations = await query<any>(
-      `SELECT unit_id, start_date, end_date FROM reservations
-       WHERE end_date >= ? AND start_date <= ?`,
-      [currentMonthStart, currentMonthEnd]
-    );
-
-    const liveUnitsList = await query<any>(
-      `SELECT u.*,
-              (SELECT b.guest_name FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date = ? LIMIT 1) as manual_checkin_guest,
-              (SELECT r.summary FROM reservations r WHERE r.unit_id = u.id AND r.start_date = ? LIMIT 1) as ical_checkin_guest,
-              (SELECT b.guest_name FROM bookings b WHERE b.unit_id = u.id AND b.checkout_date = ? LIMIT 1) as manual_checkout_guest,
-              (SELECT r.summary FROM reservations r WHERE r.unit_id = u.id AND r.end_date = ? LIMIT 1) as ical_checkout_guest,
-              (SELECT b.checkin_date FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date = ? LIMIT 1) as manual_checkin_date,
-              (SELECT r.start_date FROM reservations r WHERE r.unit_id = u.id AND r.start_date = ? LIMIT 1) as ical_checkin_date,
-              (SELECT b.checkout_date FROM bookings b WHERE b.unit_id = u.id AND b.checkout_date = ? LIMIT 1) as manual_checkout_date,
-              (SELECT r.end_date FROM reservations r WHERE r.unit_id = u.id AND r.end_date = ? LIMIT 1) as ical_checkout_date,
-              (SELECT b.guest_name FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND b.checkout_date >= ? ORDER BY b.checkin_date DESC LIMIT 1) as active_manual_guest,
-              (SELECT r.summary FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= ? AND r.end_date >= ? ORDER BY r.start_date DESC LIMIT 1) as active_ical_guest,
-              (SELECT b.checkin_date FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND b.checkout_date >= ? ORDER BY b.checkin_date DESC LIMIT 1) as active_manual_checkin,
-              (SELECT r.start_date FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= ? AND r.end_date >= ? ORDER BY r.start_date DESC LIMIT 1) as active_ical_checkin,
-              (SELECT b.checkout_date FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND b.checkout_date >= ? ORDER BY b.checkin_date DESC LIMIT 1) as active_manual_checkout,
-              (SELECT r.end_date FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= ? AND r.end_date >= ? ORDER BY r.start_date DESC LIMIT 1) as active_ical_checkout,
-              (SELECT b.notes FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND b.checkout_date >= ? ORDER BY b.checkin_date DESC LIMIT 1) as active_manual_notes,
-              (SELECT platform FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= CURRENT_DATE() AND r.end_date >= CURRENT_DATE() LIMIT 1) as platform,
-              COALESCE((SELECT SUM(amount) FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date >= ? AND b.checkin_date <= ?), 0) as total_revenue,
-              (SELECT COUNT(*) FROM bookings b2 WHERE b2.unit_id = u.id AND b2.checkin_date >= ? AND b2.checkin_date <= ?) as bookings_count,
-              (SELECT COUNT(*) FROM maintenance_tickets mt WHERE mt.unit_id = u.id AND mt.status != 'resolved') as active_maint_tickets
-       FROM units u
-       WHERE u.status = 'active' ${accountFilterUnits}
-       ORDER BY u.unit_name ASC`,
-      [
-        todayStr, todayStr, todayStr, todayStr, todayStr, todayStr, todayStr, todayStr, // Today checkin/checkout flags
-        todayStr, todayStr, // active_manual_guest
-        todayStr, todayStr, // active_ical_guest
-        todayStr, todayStr, // active_manual_checkin
-        todayStr, todayStr, // active_ical_checkin
-        todayStr, todayStr, // active_manual_checkout
-        todayStr, todayStr, // active_ical_checkout
-        todayStr, todayStr, // active_manual_notes
-        startDateStr, endDateStr, startDateStr, endDateStr,
-        ...paramsUnits
-      ]
-    );
-
-    // Fetch unit calendars for all active units
+    // Fetch unit calendars
     const activeUnitIds = liveUnitsList.map((u: any) => u.id);
     let calendars: any[] = [];
     if (activeUnitIds.length > 0) {
       calendars = await query<any>(
-        `SELECT id, unit_id, platform, is_primary FROM unit_calendars WHERE unit_id IN (${activeUnitIds.map(() => '?').join(',')})`,
+        `SELECT id, unit_id, platform, is_primary FROM unit_calendars WHERE unit_id IN (${activeUnitIds.map(() => "?").join(",")})`,
         activeUnitIds
       );
     }
 
+    // Enrich each unit with computed status and readiness data
     for (const unit of liveUnitsList) {
       unit.unit_calendars = calendars.filter((c: any) => c.unit_id === unit.id);
 
-      // 1. Sync from active booking if present and staff hasn't manually overridden it
       const activeGuest = unit.active_manual_guest || unit.active_ical_guest;
       const activeCheckinDate = unit.active_manual_checkin || unit.active_ical_checkin;
 
@@ -730,7 +252,6 @@ export async function GET(req: NextRequest) {
         const bookingStart = activeCheckinDate ? new Date(activeCheckinDate) : null;
         const lastManualUpdate = unit.readiness_updated_at ? new Date(unit.readiness_updated_at) : null;
         const staffOverrodeAfterBooking = lastManualUpdate && bookingStart && lastManualUpdate > bookingStart;
-
         if (!staffOverrodeAfterBooking) {
           readinessGuest = activeGuest;
           readinessCheckin = activeCheckinDate;
@@ -739,22 +260,15 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      // 2. Compute dynamic Today flags
       const hasCheckinToday = !!(unit.manual_checkin_date || unit.ical_checkin_date);
       const hasCheckoutToday = !!(unit.manual_checkout_date || unit.ical_checkout_date);
-      
       const updatedAt = unit.readiness_updated_at ? new Date(unit.readiness_updated_at) : null;
-      const wasUpdatedToday = updatedAt && 
-        `${updatedAt.getFullYear()}-${String(updatedAt.getMonth() + 1).padStart(2, '0')}-${String(updatedAt.getDate()).padStart(2, '0')}` === todayStr;
-      
-      let computed = unit.readiness_status || "ready";
+      const wasUpdatedToday = updatedAt && formatDate(updatedAt) === todayStr;
 
+      let computed = unit.readiness_status || "ready";
       if (!wasUpdatedToday || !unit.readiness_status) {
-        if (hasCheckoutToday && (computed === "occupied" || !unit.readiness_status)) {
-          computed = "checkout_today";
-        } else if (hasCheckinToday && (computed === "ready" || computed === "booked" || !unit.readiness_status)) {
-          computed = "checkin_today";
-        }
+        if (hasCheckoutToday && (computed === "occupied" || !unit.readiness_status)) computed = "checkout_today";
+        else if (hasCheckinToday && (computed === "ready" || computed === "booked" || !unit.readiness_status)) computed = "checkin_today";
       }
 
       unit._computed_status = computed;
@@ -766,84 +280,53 @@ export async function GET(req: NextRequest) {
       unit._readinessNotes = readinessNotes;
     }
 
+    // Group and aggregate units
     const grouped = new Map<string, { primary: any; units: any[] }>();
-
     for (const unit of liveUnitsList) {
-      const key =
-        (unit.readiness_group_id as string | null) ||
-        (unit.unit_code as string | null) ||
-        (unit.unit_name as string | null) ||
-        (unit.id as string);
-
+      const key = (unit.readiness_group_id as string | null) || (unit.unit_code as string | null) || (unit.unit_name as string | null) || (unit.id as string);
       const existing = grouped.get(key);
-      if (!existing) {
-        grouped.set(key, { primary: unit, units: [unit] });
-      } else {
-        existing.units.push(unit);
-      }
+      if (!existing) grouped.set(key, { primary: unit, units: [unit] });
+      else existing.units.push(unit);
     }
 
     const liveUnits = Array.from(grouped.values()).map(({ primary, units }) => {
-      let totalRevenue = 0;
-      let totalBookings = 0;
-      let totalMaint = 0;
+      let totalRevLive = 0, totalBookingsLive = 0, totalMaint = 0;
       const bookedDays = new Set<number>();
       const platforms = new Set<string>();
 
+      const calYear = calNow.getFullYear();
+      const calMonthStr = String(calNow.getMonth() + 1).padStart(2, "0");
+
+      const parseToYYYYMMDD = (val: any): string => {
+        if (!val) return "";
+        if (val instanceof Date) return formatDate(val);
+        if (typeof val === "string") return val.split("T")[0];
+        return "";
+      };
+
       for (const u of units) {
-        totalRevenue += Number(u.total_revenue || 0);
-        totalBookings += Number(u.bookings_count || 0);
+        totalRevLive += Number(u.total_revenue || 0);
+        totalBookingsLive += Number(u.bookings_count || 0);
         totalMaint += Number(u.active_maint_tickets || 0);
-
-        if (u.unit_calendars) {
-          for (const cal of u.unit_calendars) {
-            if (cal.platform) {
-              platforms.add(cal.platform.toLowerCase());
-            }
-          }
-        }
-
-        const unitBookings = activeBookings.filter((b: any) => b.unit_id === u.id);
-        const unitReservations = activeReservations.filter((r: any) => r.unit_id === u.id);
-
-        const parseToYYYYMMDD = (val: any) => {
-          if (!val) return "";
-          if (val instanceof Date) {
-            const year = val.getFullYear();
-            const month = String(val.getMonth() + 1).padStart(2, '0');
-            const day = String(val.getDate()).padStart(2, '0');
-            return `${year}-${month}-${day}`;
-          }
-          if (typeof val === 'string') {
-            return val.split('T')[0];
-          }
-          return "";
-        };
+        (u.unit_calendars || []).forEach((cal: any) => { if (cal.platform) platforms.add(cal.platform.toLowerCase()); });
 
         const allIntervals = [
-          ...unitBookings.map((b: any) => ({ start: parseToYYYYMMDD(b.start_date), end: parseToYYYYMMDD(b.end_date) })),
-          ...unitReservations.map((r: any) => ({ start: parseToYYYYMMDD(r.start_date), end: parseToYYYYMMDD(r.end_date) }))
+          ...activeBookings.filter((b: any) => b.unit_id === u.id).map((b: any) => ({ start: parseToYYYYMMDD(b.start_date), end: parseToYYYYMMDD(b.end_date) })),
+          ...activeReservations.filter((r: any) => r.unit_id === u.id).map((r: any) => ({ start: parseToYYYYMMDD(r.start_date), end: parseToYYYYMMDD(r.end_date) })),
         ];
 
-        const calYear = calNow.getFullYear();
-        const calMonthStr = String(calNow.getMonth() + 1).padStart(2, '0');
-
         for (let day = 1; day <= calLastDay; day++) {
-          const checkDateStr = `${calYear}-${calMonthStr}-${String(day).padStart(2, '0')}`;
+          const checkDateStr = `${calYear}-${calMonthStr}-${String(day).padStart(2, "0")}`;
           for (const interval of allIntervals) {
-            if (interval.start && interval.end) {
-              if (checkDateStr >= interval.start && checkDateStr <= interval.end) {
-                bookedDays.add(day);
-                break;
-              }
+            if (interval.start && interval.end && checkDateStr >= interval.start && checkDateStr <= interval.end) {
+              bookedDays.add(day);
+              break;
             }
           }
         }
       }
 
-      const checkinDateVal = primary._readinessCheckin;
-      const checkoutDateVal = primary._readinessCheckout;
-      const updatedAtVal = primary.readiness_updated_at;
+      const fmt = (v: any) => v ? (typeof v === "string" ? v.split("T")[0] : v.toISOString().split("T")[0]) : null;
 
       return {
         id: primary.id,
@@ -852,16 +335,15 @@ export async function GET(req: NextRequest) {
         status: primary._computed_status,
         readinessStatus: primary._computed_status,
         guest: primary._readinessGuest || null,
-        checkinDate: checkinDateVal ? (typeof checkinDateVal === 'string' ? checkinDateVal.split("T")[0] : checkinDateVal.toISOString().split("T")[0]) : null,
-        checkoutDate: checkoutDateVal ? (typeof checkoutDateVal === 'string' ? checkoutDateVal.split("T")[0] : checkoutDateVal.toISOString().split("T")[0]) : null,
+        checkinDate: fmt(primary._readinessCheckin),
+        checkoutDate: fmt(primary._readinessCheckout),
         notes: primary._readinessNotes || null,
-        updatedAt: updatedAtVal ? (typeof updatedAtVal === 'string' ? updatedAtVal : updatedAtVal.toISOString()) : null,
-        revenue: totalRevenue,
-        bookingsCount: totalBookings,
+        updatedAt: primary.readiness_updated_at ? (typeof primary.readiness_updated_at === "string" ? primary.readiness_updated_at : primary.readiness_updated_at.toISOString()) : null,
+        revenue: totalRevLive,
+        bookingsCount: totalBookingsLive,
         activeMaintTickets: totalMaint,
         bookedDays: Array.from(bookedDays),
         platforms: Array.from(platforms),
-
         unit_name: primary.unit_name,
         unit_code: primary.unit_code || null,
         readiness_status: primary.readiness_status,
@@ -872,7 +354,6 @@ export async function GET(req: NextRequest) {
         readiness_updated_at: primary.readiness_updated_at,
         readiness_updated_by: primary.readiness_updated_by,
         readiness_group_id: primary.readiness_group_id,
-
         active_manual_guest: primary.active_manual_guest,
         active_ical_guest: primary.active_ical_guest,
         active_manual_checkin: primary.active_manual_checkin,
@@ -880,14 +361,13 @@ export async function GET(req: NextRequest) {
         active_manual_checkout: primary.active_manual_checkout,
         active_ical_checkout: primary.active_ical_checkout,
         active_manual_notes: primary.active_manual_notes,
-
         _has_checkin_today: primary._has_checkin_today,
         _has_checkout_today: primary._has_checkout_today,
-        _merged_units: units
+        _merged_units: units,
       };
     });
 
-    // 11. Profitability Table (Group by Unit) - Synced with Date Filters and Hospitality Metrics (ADR, Occupancy, RevPAR)
+    // ── 14. Unit Profitability (Bookings + CRM Won) ────────
     const profitabilityList = await query<any>(
       `SELECT * FROM (
         SELECT u.id, u.unit_name, u.profit_share, inv.default_profit_share,
@@ -895,42 +375,21 @@ export async function GET(req: NextRequest) {
                   (SELECT platform FROM bookings b WHERE b.unit_id = u.id ORDER BY b.checkin_date DESC LIMIT 1),
                   (SELECT platform FROM reservations r WHERE r.unit_id = u.id ORDER BY r.start_date DESC LIMIT 1)
                 ) as platform,
-                COALESCE(
-                  (SELECT SUM(
+                -- Booking revenue (pro-rated)
+                COALESCE((SELECT SUM(
                      (b.amount / COALESCE(NULLIF(DATEDIFF(b.checkout_date, b.checkin_date), 0), 1)) *
-                     GREATEST(0, DATEDIFF(
-                       LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-                       GREATEST(b.checkin_date, ?)
-                     ) + 1)
-                   )
-                   FROM bookings b
-                   WHERE b.unit_id = u.id 
-                     AND b.checkin_date <= ? 
-                     AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ?
-                  ), 0
-                ) as b_rev,
-                COALESCE(
-                  (SELECT SUM(GREATEST(0, DATEDIFF(
-                     LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?),
-                     GREATEST(b.checkin_date, ?)
-                   ) + 1))
-                   FROM bookings b
-                   WHERE b.unit_id = u.id 
-                     AND b.checkin_date <= ? 
-                     AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ?
-                  ), 0
-                ) as b_days,
-                COALESCE(
-                  (SELECT SUM(GREATEST(0, DATEDIFF(
-                     LEAST(CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END, ?),
-                     GREATEST(r.start_date, ?)
-                   ) + 1))
-                   FROM reservations r
-                   WHERE r.unit_id = u.id 
-                     AND r.start_date <= ? 
-                     AND (CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END) >= ?
-                  ), 0
-                ) as r_days,
+                     GREATEST(0, DATEDIFF(LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?), GREATEST(b.checkin_date, ?)) + 1)
+                   ) FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ?), 0) as b_rev,
+                -- Booking occupied days
+                COALESCE((SELECT SUM(GREATEST(0, DATEDIFF(LEAST(CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END, ?), GREATEST(b.checkin_date, ?)) + 1)) FROM bookings b WHERE b.unit_id = u.id AND b.checkin_date <= ? AND (CASE WHEN b.checkout_date = b.checkin_date THEN b.checkout_date ELSE b.checkout_date - INTERVAL 1 DAY END) >= ?), 0) as b_days,
+                -- iCal occupied days
+                COALESCE((SELECT SUM(GREATEST(0, DATEDIFF(LEAST(CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END, ?), GREATEST(r.start_date, ?)) + 1)) FROM reservations r WHERE r.unit_id = u.id AND r.start_date <= ? AND (CASE WHEN r.end_date = r.start_date THEN r.end_date ELSE r.end_date - INTERVAL 1 DAY END) >= ?), 0) as r_days,
+                -- CRM Won deal value
+                COALESCE((SELECT SUM(cd.value) FROM crm_deals cd WHERE cd.unit_id = u.id AND cd.stage IN ('completed', 'management') AND cd.created_at >= ? AND cd.created_at <= ?), 0) as crm_won_value,
+                -- CRM Pipeline value
+                COALESCE((SELECT SUM(cd.value) FROM crm_deals cd WHERE cd.unit_id = u.id AND cd.status = 'open' AND cd.created_at >= ? AND cd.created_at <= ?), 0) as crm_pipeline_value,
+                -- CRM Won count
+                (SELECT COUNT(*) FROM crm_deals cd WHERE cd.unit_id = u.id AND cd.stage IN ('completed', 'management') AND cd.created_at >= ? AND cd.created_at <= ?) as crm_won_count,
                 (SELECT COUNT(*) FROM reservations r2 WHERE r2.unit_id = u.id AND r2.start_date <= ? AND (CASE WHEN r2.end_date = r2.start_date THEN r2.end_date ELSE r2.end_date - INTERVAL 1 DAY END) >= ?) as r_count,
                 (SELECT COUNT(*) FROM bookings b2 WHERE b2.unit_id = u.id AND b2.checkin_date <= ? AND (CASE WHEN b2.checkout_date = b2.checkin_date THEN b2.checkout_date ELSE b2.checkout_date - INTERVAL 1 DAY END) >= ?) as b_count,
                 (SELECT COUNT(*) FROM maintenance_tickets mt WHERE mt.unit_id = u.id AND mt.status = 'resolved' AND mt.created_at >= ? AND mt.created_at <= ?) as m_tickets
@@ -939,556 +398,85 @@ export async function GET(req: NextRequest) {
          WHERE u.status = 'active' ${accountFilterUnits}
          GROUP BY u.id, u.unit_name, u.profit_share, inv.default_profit_share
        ) as tmp
-       ORDER BY b_rev DESC`,
+       ORDER BY (b_rev + crm_won_value) DESC`,
       [
         endDateStr, startDateStr, endDateStr, startDateStr, // b_rev
         endDateStr, startDateStr, endDateStr, startDateStr, // b_days
         endDateStr, startDateStr, endDateStr, startDateStr, // r_days
+        startDateStr + " 00:00:00", endDateStr + " 23:59:59", // crm_won_value
+        startDateStr + " 00:00:00", endDateStr + " 23:59:59", // crm_pipeline_value
+        startDateStr + " 00:00:00", endDateStr + " 23:59:59", // crm_won_count
         endDateStr, startDateStr, // r_count
         endDateStr, startDateStr, // b_count
         startDateStr, endDateStr, // m_tickets
-        ...paramsUnits
+        ...paramsUnits,
       ]
     );
 
     const profitability = profitabilityList.map((unit: any) => {
-      const uRev = Number(unit.b_rev);
-      const bDays = Number(unit.b_days);
-      const rDays = Number(unit.r_days);
+      const bookingRev = Number(unit.b_rev || 0);
+      const crmWonValue = Number(unit.crm_won_value || 0);
+      const crmPipelineValue = Number(unit.crm_pipeline_value || 0);
+      const crmWonCount = Number(unit.crm_won_count || 0);
+      const uRev = bookingRev + crmWonValue;
+      const bDays = Number(unit.b_days || 0);
+      const rDays = Number(unit.r_days || 0);
       const occupiedDays = bDays + rDays;
-      const availableDays = daysCount;
+      const occupancy = daysCount > 0 ? Math.min(100, Math.round((occupiedDays / daysCount) * 100)) : 0;
+      const adrUnit = bDays > 0 ? Math.round(bookingRev / bDays) : 0;
+      const revparUnit = daysCount > 0 ? Math.round(bookingRev / daysCount) : 0;
 
-      const occupancy = availableDays > 0 ? Math.min(100, Math.round((occupiedDays / availableDays) * 100)) : 0;
-      const adr = bDays > 0 ? Math.round(uRev / bDays) : 0;
-      const revpar = availableDays > 0 ? Math.round(uRev / availableDays) : 0;
-
-      // Profit percentage: check override, fallback to default, default to 100.00
       const profitShare = unit.profit_share !== null && unit.profit_share !== undefined
         ? Number(unit.profit_share)
-        : (unit.default_profit_share !== null && unit.default_profit_share !== undefined
-           ? Number(unit.default_profit_share)
-           : 100.00);
+        : (unit.default_profit_share !== null && unit.default_profit_share !== undefined ? Number(unit.default_profit_share) : 100.00);
 
-      // Clean cost estimate: Set to 0 per user instruction
-      const cleanCost = 0;
-      const totalCost = 0;
-      // Calculate net profit based on company's percentage of the profit (Revenue - Costs)
-      const netProfit = Math.max(0, (uRev - totalCost) * (profitShare / 100));
+      const investorPct = Math.max(0, 100 - profitShare);
+      const investorPayout = Math.round(uRev * (investorPct / 100));
+      const netProfit = Math.round(uRev * (profitShare / 100));
       const margin = uRev > 0 ? ((netProfit / uRev) * 100).toFixed(1) : "0.0";
 
       return {
         name: unit.unit_name,
         platform: unit.platform ? (unit.platform === "airbnb" ? "Airbnb" : "Gathern") : "حجز مباشر",
-        revenueVal: uRev,
-        costVal: totalCost,
-        profitVal: netProfit,
-        marginVal: Number(margin),
-        occupancyVal: occupancy,
-        adrVal: adr,
-        revparVal: revpar,
+        revenueVal: uRev, bookingRevenueVal: bookingRev, crmRevenueVal: crmWonValue,
+        crmPipelineVal: crmPipelineValue, crmWonCount, costVal: investorPayout,
+        profitVal: netProfit, marginVal: Number(margin), occupancyVal: occupancy,
+        adrVal: adrUnit, revparVal: revparUnit, profitSharePct: profitShare, investorPct,
         revenue: `${uRev.toLocaleString("en-US")} ر.س`,
-        cost: `${totalCost.toLocaleString("en-US")} ر.س`,
+        bookingRevenue: `${bookingRev.toLocaleString("en-US")} ر.س`,
+        crmRevenue: `${crmWonValue.toLocaleString("en-US")} ر.س`,
+        crmPipeline: `${crmPipelineValue.toLocaleString("en-US")} ر.س`,
+        cost: `${investorPayout.toLocaleString("en-US")} ر.س`,
         profit: `${netProfit.toLocaleString("en-US")} ر.س`,
-        margin: `${margin}%`,
-        occupancy: `${occupancy}%`,
-        adr: `${adr.toLocaleString("en-US")} ر.س`,
-        revpar: `${revpar.toLocaleString("en-US")} ر.س`,
+        margin: `${margin}%`, occupancy: `${occupancy}%`,
+        adr: `${adrUnit.toLocaleString("en-US")} ر.س`, revpar: `${revparUnit.toLocaleString("en-US")} ر.س`,
         status: Number(margin) > 75 ? "high" : "normal",
       };
     });
 
-    // 12. CRM Pipeline & Analytics with Date and Unit/Account filters
-    let crmAccountFilter = "";
-    const paramsCrm: unknown[] = [startDateStr + " 00:00:00", endDateStr + " 23:59:59"];
-    if (account !== "all") {
-      const accountIds = account.split(",");
-      const placeholders = accountIds.map(() => "?").join(",");
-      crmAccountFilter = ` AND c.unit_id IN (SELECT id FROM units WHERE platform_account_id IN (${placeholders})) `;
-      paramsCrm.push(...accountIds);
-    }
+    // ── 15. CRM ────────────────────────────────────────────
+    const { crmKPIs, crmStatusDistribution, paramsCrm, crmAccountFilter } =
+      await fetchCrmKPIs(startDateStr, endDateStr, account);
+    const [crmPipeline, recentDeals] = await Promise.all([
+      fetchCrmPipeline(paramsCrm, crmAccountFilter),
+      fetchRecentDeals(paramsCrm, crmAccountFilter),
+    ]);
 
-    const crmStats = await queryOne<any>(
-      `SELECT 
-         COUNT(*) as total_deals,
-         SUM(CASE WHEN c.status = 'open' THEN 1 ELSE 0 END) as open_count,
-         COALESCE(SUM(CASE WHEN c.status = 'open' THEN c.value ELSE 0 END), 0) as open_value,
-         SUM(CASE WHEN c.status = 'closed' AND c.stage IN ('completed', 'management') THEN 1 ELSE 0 END) as won_count,
-         COALESCE(SUM(CASE WHEN c.status = 'closed' AND c.stage IN ('completed', 'management') THEN c.value ELSE 0 END), 0) as won_value,
-         SUM(CASE WHEN c.stage = 'lost' THEN 1 ELSE 0 END) as lost_count,
-         COALESCE(AVG(CASE WHEN c.value > 0 THEN c.value ELSE NULL END), 0) as avg_value
-       FROM crm_deals c
-       WHERE c.created_at >= ? AND c.created_at <= ? ${crmAccountFilter}`,
-      paramsCrm
-    );
+    // ── 16. HR ─────────────────────────────────────────────
+    const [{ hrPayroll, hrPayrollDetails }, { employeeAttendance, attendanceStats }, { jobTitleStats, leaveRequests }] =
+      await Promise.all([
+        fetchHRPayroll(startDateStr, endDateStr),
+        fetchAttendanceReport(startDateStr, endDateStr, range),
+        fetchHRMiscData(startDateStr, endDateStr),
+      ]);
 
-    const totalCustomersRes = await queryOne<any>("SELECT COUNT(*) as count FROM customers");
-    const totalCustomersCount = Number(totalCustomersRes?.count || 0);
+    // ── 17. Maintenance & Invoices ─────────────────────────
+    const [maintenanceAnalytics, invoiceAnalytics] = await Promise.all([
+      fetchMaintenanceAnalytics(startDateStr, endDateStr, accountFilterUnits, paramsUnits),
+      fetchInvoiceAnalytics(startDateStr, endDateStr),
+    ]);
 
-    const totalResolved = Number(crmStats?.won_count || 0) + Number(crmStats?.lost_count || 0);
-    const crmKPIs = {
-      pipelineValue: `${Number(crmStats?.open_value || 0).toLocaleString("en-US")} ر.س`,
-      wonValue: `${Number(crmStats?.won_value || 0).toLocaleString("en-US")} ر.س`,
-      avgDealValue: `${Math.round(Number(crmStats?.avg_value || 0)).toLocaleString("en-US")} ر.س`,
-      conversionRate: totalResolved > 0 
-        ? `${((Number(crmStats?.won_count || 0) / totalResolved) * 100).toFixed(1)}%` 
-        : "0.0%",
-      totalCustomers: totalCustomersCount.toLocaleString("en-US"),
-      openCount: Number(crmStats?.open_count || 0),
-      wonCount: Number(crmStats?.won_count || 0),
-      lostCount: Number(crmStats?.lost_count || 0),
-    };
-
-    const crmStatusDistribution = [
-      { name: "صفقات نشطة", value: Number(crmStats?.open_count || 0), color: "#3b82f6" },
-      { name: "صفقات مؤكدة", value: Number(crmStats?.won_count || 0), color: "#10b981" },
-      { name: "صفقات خاسرة", value: Number(crmStats?.lost_count || 0), color: "#ef4444" },
-    ].filter(item => item.value > 0);
-
-    const crmPipelineList = await query<any>(
-      `SELECT c.stage, COUNT(*) as count, SUM(c.value) as val 
-       FROM crm_deals c 
-       WHERE c.status = 'open' AND c.created_at >= ? AND c.created_at <= ? ${crmAccountFilter}
-       GROUP BY c.stage`,
-      paramsCrm
-    );
-
-    const stagesMapping: Record<string, { label: string; percent: string; bg: string }> = {
-      negotiation: { label: "مفاوضات وبانتظار الدفع", percent: "30%", bg: "bg-blue-500" },
-      partial_payment: { label: "تم دفع عربون / دفعة جزئية", percent: "60%", bg: "bg-amber-500" },
-      completed: { label: "صفقات مكتملة ومؤكدة", percent: "90%", bg: "bg-emerald-500" },
-      management: { label: "تحت التشغيل والإدارة", percent: "100%", bg: "bg-indigo-500" },
-    };
-
-    const crmPipeline = Object.entries(stagesMapping).map(([key, meta]) => {
-      const found = crmPipelineList.find((item) => item.stage === key);
-      const count = found ? found.count : 0;
-      const value = found ? Number(found.val) : 0;
-
-      return {
-        stage: meta.label,
-        count: count === 1 ? "1 صفقة" : count > 1 ? `${count} صفقات` : "0 صفقة",
-        value: `${value.toLocaleString("en-US")} ر.س`,
-        rawValue: value,
-        rawCount: count,
-        percent: meta.percent,
-        bg: meta.bg,
-      };
-    });
-
-    const recentDealsList = await query<any>(
-      `SELECT c.id, c.title, c.value, c.stage, c.priority, c.expected_close_date, cust.full_name as customer_name
-       FROM crm_deals c
-       LEFT JOIN customers cust ON c.customer_id = cust.id
-       WHERE c.created_at >= ? AND c.created_at <= ? ${crmAccountFilter}
-       ORDER BY c.created_at DESC`,
-      paramsCrm
-    );
-
-    const recentDeals = recentDealsList.map((deal: any) => {
-      let status = "تفاوض نشط";
-      if (deal.stage === "completed" || deal.stage === "management") status = "تم التأكيد";
-      else if (deal.stage === "negotiation") status = "بانتظار الدفع";
-      else if (deal.stage === "partial_payment") status = "دفعة جزئية";
-
-      return {
-        id: deal.id,
-        title: deal.title || "صفقة جديدة",
-        customer: deal.customer_name || "عميل عام",
-        value: Number(deal.value),
-        price: `${Number(deal.value).toLocaleString("en-US")} ر.س`,
-        stage: deal.stage,
-        priority: deal.priority || "medium",
-        expectedClose: deal.expected_close_date ? deal.expected_close_date.toString().slice(0, 10) : "غير محدد",
-        status,
-      };
-    });
-
-    // 13. HR & Payroll Overview (Detailed currency breakdown and advanced metrics)
-    const hrActiveEmployees = await query<any>(
-      `SELECT e.basic_salary, e.housing_allowance, e.transport_allowance, e.other_allowances, e.hire_date, e.salary_currency 
-       FROM hr_employees e
-       LEFT JOIN users u ON e.user_id = u.id
-       WHERE e.status = 'active'
-         AND (u.role IS NULL OR u.role NOT IN ('super_admin', 'accountant'))
-         AND (e.hire_date IS NULL OR e.hire_date <= ?)`,
-      [endDateStr]
-    );
-
-    let sarBasic = 0;
-    let sarAllowances = 0;
-    let egpBasic = 0;
-    let egpAllowances = 0;
-    let sarDeductions = 0;
-    let egpDeductions = 0;
-
-    const start = new Date(startDateStr);
-    const end = new Date(endDateStr);
-    const periodDays = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1);
-
-    for (const emp of hrActiveEmployees) {
-      const hireDate = emp.hire_date ? new Date(emp.hire_date) : null;
-      const b = Number(emp.basic_salary || 0);
-      const a = Number(emp.housing_allowance || 0) + 
-                Number(emp.transport_allowance || 0) + 
-                Number(emp.other_allowances || 0);
-      const d = Math.round(b * 0.02);
-
-      // Prorate by days in period
-      let days = periodDays;
-      if (hireDate && hireDate > start) {
-        days = Math.max(1, Math.ceil((end.getTime() - hireDate.getTime()) / (1000 * 60 * 60 * 24)) + 1);
-      }
-
-      const factor = days / 30;
-      const proratedB = b * factor;
-      const proratedA = a * factor;
-      const proratedD = d * factor;
-
-      if (emp.salary_currency?.toUpperCase() === 'EGP') {
-        egpBasic += proratedB;
-        egpAllowances += proratedA;
-        egpDeductions += proratedD;
-      } else {
-        sarBasic += proratedB;
-        sarAllowances += proratedA;
-        sarDeductions += proratedD;
-      }
-    }
-
-    const sarNet = Math.round(sarBasic + sarAllowances - sarDeductions);
-    const egpNet = Math.round(egpBasic + egpAllowances - egpDeductions);
-
-    // EGP employees are not included in unified SAR payroll costs (accountant enters them manually in SAR)
-    const totalPayrollSAR = Math.round(sarNet);
-
-    const hrPayroll = {
-      basic: `${Math.round(sarBasic).toLocaleString("en-US")} ر.س`,
-      allowances: `${Math.round(sarAllowances).toLocaleString("en-US")} ر.س`,
-      deductions: `${Math.round(sarDeductions).toLocaleString("en-US")} ر.س`,
-      net: `${totalPayrollSAR.toLocaleString("en-US")} ر.س`,
-    };
-
-    const hrPayrollDetails = {
-      sar: {
-        basic: `${Math.round(sarBasic).toLocaleString("en-US")} ر.س`,
-        allowances: `${Math.round(sarAllowances).toLocaleString("en-US")} ر.س`,
-        deductions: `${Math.round(sarDeductions).toLocaleString("en-US")} ر.س`,
-        net: `${sarNet.toLocaleString("en-US")} ر.س`,
-        rawNet: sarNet,
-      },
-      egp: {
-        basic: `${Math.round(egpBasic).toLocaleString("en-US")} ج.م`,
-        allowances: `${Math.round(egpAllowances).toLocaleString("en-US")} ج.م`,
-        deductions: `${Math.round(egpDeductions).toLocaleString("en-US")} ج.م`,
-        net: `${egpNet.toLocaleString("en-US")} ج.م`,
-        rawNet: egpNet,
-      },
-      activeEmployeesSAR: hrActiveEmployees.filter((e: any) => e.salary_currency?.toUpperCase() !== 'EGP').length,
-      activeEmployeesEGP: hrActiveEmployees.filter((e: any) => e.salary_currency?.toUpperCase() === 'EGP').length,
-      totalActiveEmployees: hrActiveEmployees.length,
-    };
-
-    // Employee list with shift information (filtered by date range)
-    const employeeList = await query<any>(
-      `SELECT e.id, e.full_name, e.job_title, e.salary_currency, e.basic_salary,
-              e.housing_allowance, e.transport_allowance, e.other_allowances, e.hire_date,
-              s.days_off
-       FROM hr_employees e
-       LEFT JOIN hr_shifts s ON e.shift_id = s.id
-       LEFT JOIN users u ON e.user_id = u.id
-       WHERE e.status = 'active'
-         AND (u.role IS NULL OR u.role NOT IN ('super_admin', 'accountant'))
-         AND (e.hire_date IS NULL OR e.hire_date <= ?)`,
-      [endDateStr]
-    );
-
-    // Active approved leave requests overlapping with selected range
-    const activeLeaves = await query<any>(
-      `SELECT employee_id, start_date, end_date
-       FROM hr_requests
-       WHERE status = 'approved' AND start_date <= ? AND end_date >= ?`,
-      [endDateStr, startDateStr]
-    );
-
-    // Attendance logs inside selected range
-    const attendanceRecords = await query<any>(
-      `SELECT employee_id, date, status
-       FROM hr_attendance
-       WHERE date >= ? AND date <= ?`,
-      [startDateStr, endDateStr]
-    );
-
-    const getDatesInRange = (startStr: string, endStr: string) => {
-      const dates: string[] = [];
-      const current = new Date(startStr);
-      const last = new Date(endStr);
-      while (current <= last) {
-        const year = current.getFullYear();
-        const month = String(current.getMonth() + 1).padStart(2, "0");
-        const day = String(current.getDate()).padStart(2, "0");
-        dates.push(`${year}-${month}-${day}`);
-        current.setDate(current.getDate() + 1);
-      }
-      return dates;
-    };
-
-    // Map attendance records for rapid lookup
-    const attendanceMap: Record<string, Record<string, string>> = {};
-    for (const att of attendanceRecords) {
-      const empId = att.employee_id;
-      const dateStr = att.date instanceof Date 
-        ? att.date.toISOString().split("T")[0] 
-        : String(att.date).split(" ")[0];
-      if (!attendanceMap[empId]) {
-        attendanceMap[empId] = {};
-      }
-      attendanceMap[empId][dateStr] = att.status;
-    }
-
-    // Fetch default days off dynamically from hr_settings to match reports portal fallback
-    const defaultOffSetting = await queryOne<{ setting_value: string }>(
-      "SELECT setting_value FROM hr_settings WHERE setting_key = 'default_days_off'"
-    );
-    const defaultOffDays = defaultOffSetting?.setting_value
-      ? defaultOffSetting.setting_value.split(",").filter(Boolean).map(Number)
-      : [5, 6];
-
-    // Compute UTC+3 local date and yesterday date for accurate range capping
-    const localNow = new Date(Date.now() + 3 * 60 * 60 * 1000);
-    const yesterday = new Date(localNow.getTime() - 24 * 60 * 60 * 1000);
-    const yesterdayStr = yesterday.toISOString().split("T")[0];
-
-    let globalPresent = 0;
-    let globalLate = 0;
-    let globalAbsent = 0;
-    let globalLeave = 0;
-
-    const SYSTEM_START_DATE = "2026-06-01";
-
-    const employeeAttendance = employeeList.map((emp: any) => {
-      let empStart = startDateStr;
-      if (empStart < SYSTEM_START_DATE) {
-        empStart = SYSTEM_START_DATE;
-      }
-      if (emp.hire_date) {
-        const hireStr = emp.hire_date instanceof Date 
-          ? emp.hire_date.toISOString().split("T")[0] 
-          : String(emp.hire_date).split(" ")[0];
-        if (hireStr > empStart) {
-          empStart = hireStr;
-        }
-      }
-
-      // Cap the end date at yesterday for non-daily ranges to prevent today's pending logs from counting as absences
-      const empEnd = range === "today" 
-        ? startDateStr 
-        : (endDateStr < yesterdayStr ? endDateStr : yesterdayStr);
-
-      let expected = 0;
-      let present = 0;
-      let late = 0;
-      let absent = 0;
-      let leave = 0;
-
-      const basic = Number(emp.basic_salary || 0);
-      const allowances = Number(emp.housing_allowance || 0) + 
-                         Number(emp.transport_allowance || 0) + 
-                         Number(emp.other_allowances || 0);
-      const deductions = Math.round(basic * 0.02);
-      const net = basic + allowances - deductions;
-
-      if (empStart <= empEnd) {
-        const dates = getDatesInRange(empStart, empEnd);
-        const daysOff = emp.days_off 
-          ? emp.days_off.split(",").filter(Boolean).map(Number) 
-          : defaultOffDays;
-        const empLeaves = activeLeaves.filter((l: any) => l.employee_id === emp.id);
-
-        for (const dStr of dates) {
-          const dateObj = new Date(dStr);
-          const dayOfWeek = dateObj.getDay();
-
-          // 1. Check weekly day off
-          if (daysOff.includes(dayOfWeek)) {
-            continue;
-          }
-
-          // 2. Check attendance records or approved leaves
-          const attStatus = attendanceMap[emp.id]?.[dStr];
-          if (attStatus) {
-            if (attStatus === 'present') {
-              present++;
-            } else if (attStatus === 'late') {
-              present++;
-              late++;
-            } else if (attStatus === 'absent') {
-              absent++;
-            } else if (attStatus === 'leave' || attStatus === 'holiday') {
-              leave++;
-            }
-          } else {
-            // Missing check-in -> Check if employee was on an approved leave request
-            const onLeave = empLeaves.some((l: any) => {
-              const lStart = l.start_date instanceof Date ? l.start_date.toISOString().split("T")[0] : String(l.start_date).split(" ")[0];
-              const lEnd = l.end_date instanceof Date ? l.end_date.toISOString().split("T")[0] : String(l.end_date).split(" ")[0];
-              return dStr >= lStart && dStr <= lEnd;
-            });
-
-            if (onLeave) {
-              leave++;
-            } else {
-              absent++;
-            }
-          }
-        }
-      }
-
-      // Compute total expected workdays including leaves to match the reports portal formula
-      expected = present + absent + leave;
-
-      globalPresent += present;
-      globalLate += late;
-      globalAbsent += absent;
-      globalLeave += leave;
-
-      const attendanceRate = expected > 0 ? Math.round((present / expected) * 100) : -1;
-
-      return {
-        id: emp.id,
-        name: emp.full_name,
-        jobTitle: emp.job_title || "موظف",
-        currency: emp.salary_currency || "SAR",
-        basic,
-        allowances,
-        deductions,
-        net,
-        totalDays: expected,
-        presentDays: present,
-        lateDays: late,
-        absentDays: absent,
-        leaveDays: leave,
-        attendanceRate,
-        attend: `${attendanceRate}% حضور`,
-        delay: `${late} تأخير`,
-      };
-    });
-
-    const attendanceStats = [
-      { status: "حاضر", count: globalPresent },
-      { status: "متأخر", count: globalLate },
-      { status: "غائب", count: globalAbsent },
-      { status: "إجازة", count: globalLeave }
-    ].filter(item => item.count > 0);
-
-    // Job Title distribution count excluding super_admin and accountant (filtered by date range)
-    const jobTitleStatsList = await query<any>(
-      `SELECT e.job_title, COUNT(*) as count 
-       FROM hr_employees e
-       LEFT JOIN users u ON e.user_id = u.id
-       WHERE e.status = 'active'
-         AND (u.role IS NULL OR u.role NOT IN ('super_admin', 'accountant'))
-         AND (e.hire_date IS NULL OR e.hire_date <= ?)
-       GROUP BY e.job_title`,
-      [endDateStr]
-    );
-    const jobTitleStats = jobTitleStatsList.map((r: any) => ({
-      name: r.job_title || "غير محدد",
-      value: Number(r.count || 0),
-    }));
-
-    // Active Leave Requests excluding super_admin and accountant (filtered by date range overlap)
-    const leaveRequestsList = await query<any>(
-      `SELECT r.id, r.request_type, r.start_date, r.end_date, r.days_count, r.reason, r.status, e.full_name as employee_name
-       FROM hr_requests r
-       INNER JOIN hr_employees e ON r.employee_id = e.id
-       LEFT JOIN users u ON e.user_id = u.id
-       WHERE (u.role IS NULL OR u.role NOT IN ('super_admin', 'accountant'))
-         AND (r.start_date <= ? AND r.end_date >= ?)
-       ORDER BY r.created_at DESC`,
-      [endDateStr, startDateStr]
-    );
-
-    const arabicRequestTypes: Record<string, string> = {
-      annual_leave: "إجازة سنوية",
-      sick_leave: "إجازة مرضية",
-      unpaid_leave: "إجازة بدون راتب",
-      emergency_leave: "إجازة طارئة",
-    };
-
-    const arabicRequestStatuses: Record<string, string> = {
-      pending: "معلقة",
-      approved: "معتمدة",
-      rejected: "مرفوضة",
-    };
-
-    const leaveRequests = leaveRequestsList.map((r: any) => ({
-      id: r.id,
-      employeeName: r.employee_name,
-      type: arabicRequestTypes[r.request_type] || r.request_type,
-      startDate: r.start_date ? (typeof r.start_date === 'string' ? r.start_date.split("T")[0] : r.start_date.toISOString().split("T")[0]) : "",
-      endDate: r.end_date ? (typeof r.end_date === 'string' ? r.end_date.split("T")[0] : r.end_date.toISOString().split("T")[0]) : "",
-      daysCount: parseFloat(r.days_count || 0),
-      reason: r.reason || "لا يوجد سبب محدد",
-      status: r.status,
-      statusLabel: arabicRequestStatuses[r.status] || r.status,
-    }));
-
-    // Maintenance status distribution
-    const mtStatusList = await query<any>(
-      `SELECT mt.status, COUNT(*) as count 
-       FROM maintenance_tickets mt
-       INNER JOIN units u ON mt.unit_id = u.id
-       WHERE mt.created_at >= ? AND mt.created_at <= ? ${accountFilterUnits}
-       GROUP BY mt.status`,
-      [startDateStr + " 00:00:00", endDateStr + " 23:59:59", ...paramsUnits]
-    );
-
-    // Top 5 units with maintenance tickets
-    const mtTopUnitsList = await query<any>(
-      `SELECT u.unit_name as name, COUNT(mt.id) as count 
-       FROM maintenance_tickets mt
-       INNER JOIN units u ON mt.unit_id = u.id
-       WHERE mt.created_at >= ? AND mt.created_at <= ? ${accountFilterUnits}
-       GROUP BY u.id, u.unit_name
-       ORDER BY count DESC LIMIT 5`,
-      [startDateStr + " 00:00:00", endDateStr + " 23:59:59", ...paramsUnits]
-    );
-
-    const maintenanceAnalytics = {
-      statusDist: mtStatusList.map((r: any) => ({
-        status: r.status === "resolved" ? "محلولة" : r.status === "in_progress" ? "قيد المعالجة" : "مفتوحة",
-        count: Number(r.count || 0)
-      })),
-      topUnits: mtTopUnitsList.map((r: any) => ({
-        name: r.name,
-        count: Number(r.count || 0)
-      }))
-    };
-
-    // Invoice state distribution
-    const invoiceStateList = await query<any>(
-      `SELECT state, COUNT(*) as count, SUM(total_amount) as total 
-       FROM accounting_invoices 
-       WHERE deleted_at IS NULL
-         AND invoice_date >= ? AND invoice_date <= ?
-       GROUP BY state`,
-      [startDateStr, endDateStr]
-    );
-
-    const arabicStates: Record<string, string> = {
-      draft: "مسودة",
-      posted: "مرحلة",
-      confirmed: "مؤكدة",
-      paid: "مدفوعة",
-      cancelled: "ملغاة"
-    };
-
-    const invoiceAnalytics = invoiceStateList.map((r: any) => ({
-      state: arabicStates[r.state] || r.state,
-      count: Number(r.count || 0),
-      total: Number(r.total || 0)
-    }));
-
+    // ── 18. Assemble & cache response ──────────────────────
     const responseData = {
       stats: {
         totalRevenue: `${totalRevenue.toLocaleString("en-US")} ر.س`,
@@ -1501,18 +489,9 @@ export async function GET(req: NextRequest) {
         repeatGuestRate: `${repeatGuestRate}%`,
       },
       platformShare: {
-        airbnb: {
-          percent: totalRevenue > 0 ? Math.round((platformShare.airbnb / totalRevenue) * 100) : 0,
-          value: `${platformShare.airbnb.toLocaleString("en-US")} ر.س`,
-        },
-        gathern: {
-          percent: totalRevenue > 0 ? Math.round((platformShare.gathern / totalRevenue) * 100) : 0,
-          value: `${platformShare.gathern.toLocaleString("en-US")} ر.س`,
-        },
-        external: {
-          percent: totalRevenue > 0 ? Math.round((platformShare.external / totalRevenue) * 100) : 0,
-          value: `${platformShare.external.toLocaleString("en-US")} ر.س`,
-        },
+        airbnb: { percent: totalRevenue > 0 ? Math.round((platformShare.airbnb / totalRevenue) * 100) : 0, value: `${platformShare.airbnb.toLocaleString("en-US")} ر.س` },
+        gathern: { percent: totalRevenue > 0 ? Math.round((platformShare.gathern / totalRevenue) * 100) : 0, value: `${platformShare.gathern.toLocaleString("en-US")} ر.س` },
+        external: { percent: totalRevenue > 0 ? Math.round((platformShare.external / totalRevenue) * 100) : 0, value: `${platformShare.external.toLocaleString("en-US")} ر.س` },
       },
       monthlyData,
       liveUnits,
@@ -1531,12 +510,9 @@ export async function GET(req: NextRequest) {
       invoiceAnalytics,
     };
 
-    analyticsCache.set(cacheKey, {
-      data: responseData,
-      timestamp: Date.now(),
-    });
-
+    analyticsCache.set(cacheKey, { data: responseData, timestamp: Date.now() });
     return NextResponse.json(responseData);
+
   } catch (error: any) {
     console.error("Analytics Route Error:", error);
     return NextResponse.json({ error: "فشل استيراد وتحليل البيانات" }, { status: 500 });
