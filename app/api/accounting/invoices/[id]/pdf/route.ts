@@ -90,6 +90,7 @@ const createStyles = (themeName: PDFTheme = 'default') => {
     return StyleSheet.create({
         page: {
             padding: 50,
+            paddingBottom: 120,
             fontSize: 10,
             fontFamily: "Noto Kufi Arabic",
             backgroundColor: t.bg,
@@ -257,6 +258,17 @@ const createStyles = (themeName: PDFTheme = 'default') => {
             textAlign: "right",
             lineHeight: 1.4,
             flex: 1,
+        },
+
+        notesBox: {
+            marginTop: 16,
+            width: "100%",
+        },
+        notesText: {
+            fontSize: 9,
+            color: t.text,
+            textAlign: "right",
+            lineHeight: 1.6,
         },
 
         grandTotalRow: {
@@ -472,10 +484,18 @@ function generateInvoicePDF(invoice: AccountingInvoice, company: CompanySettings
                 )
             ),
 
+            /* Invoice notes belong in the page flow so long notes can wrap. */
+            invoice.notes && React.createElement(
+                View,
+                { style: styles.notesBox },
+                React.createElement(Text, { style: styles.termsTitle }, "ملاحظات"),
+                React.createElement(Text, { style: styles.notesText }, invoice.notes)
+            ),
+
             /* Footer */
             React.createElement(
                 View,
-                { style: styles.footer },
+                { style: styles.footer, fixed: true },
                 // Only Invoice Specific Terms in footer now (e.g. Net 30)
                 invoice.payment_terms && React.createElement(Text, { style: { ...styles.footerText, fontSize: 7, marginBottom: 8, fontWeight: 'bold' } }, `شروط الدفع: ${invoice.payment_terms}`),
                 

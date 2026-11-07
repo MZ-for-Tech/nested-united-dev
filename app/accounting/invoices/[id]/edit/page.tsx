@@ -50,7 +50,11 @@ export default function EditInvoicePage() {
                 <p className="text-gray-600 mt-1">تعديل بيانات الفاتورة</p>
             </div>
 
-            <InvoiceForm initialData={invoice} invoiceId={invoice.id} />
+            <InvoiceForm
+                initialData={invoice}
+                invoiceId={invoice.id}
+                invoiceType={invoice.invoice_type === "vendor_bill" || invoice.invoice_type === "supplier_bill" ? "vendor_bill" : "customer_invoice"}
+            />
         </div>
     );
 }

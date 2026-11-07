@@ -99,7 +99,15 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
     const [isUploading, setIsUploading] = useState(false);
 
     const [items, setItems] = useState<InvoiceLine[]>(
-        initialData?.lines || [
+        // MySQL DECIMAL columns arrive as strings, even though the API types
+        // describe numbers. Normalize before adding discounts to the totals.
+        initialData?.lines?.map((line) => ({
+            ...line,
+            quantity: Number(line.quantity),
+            unit_price: Number(line.unit_price),
+            discount_value: Number(line.discount_value ?? 0),
+            tax_rate: Number(line.tax_rate ?? 0),
+        })) || [
             {
                 description: "",
                 quantity: 1,
