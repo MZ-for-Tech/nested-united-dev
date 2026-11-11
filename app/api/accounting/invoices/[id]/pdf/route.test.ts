@@ -39,7 +39,7 @@ describe("Invoice PDF export", () => {
         expect(Buffer.from(await response.arrayBuffer()).toString()).toBe("%PDF-test");
         const html = setContent.mock.calls[0][0] as string;
         expect(html).toContain("lang=\"ar\" dir=\"rtl\"");
-        expect(html).toContain("تاريخ الدخول: 2026-11-07<br>وقت الدخول: 04:00 مساءً");
+        expect(html).toContain('تاريخ الدخول: <bdi dir="ltr">2026-11-07</bdi><br>وقت الدخول: <bdi dir="ltr">04:00</bdi> مساءً');
         expect(html).toContain("data:image/png;base64,");
         expect(html.includes("ضريبة القيمة المضافة")).toBe(Boolean(taxRate));
     });
