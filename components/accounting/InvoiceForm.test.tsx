@@ -70,4 +70,19 @@ describe("InvoiceForm database values", () => {
         ])) }} />));
         expect(container.textContent).toContain("258.75 ر.س");
     });
+
+    it("omits tax from totals and submitted lines when disabled", async () => {
+        await act(async () => root.render(<InvoiceForm invoiceId="invoice-1" initialData={{
+            partner_id: "partner-1", partner_name: "Customer", invoice_date: "2026-11-07", due_date: "2026-11-07",
+            lines: [{ description: "Stay", quantity: 1, unit_price: 100, discount_type: "fixed", discount_value: 0, tax_rate: 15 }],
+        }} />));
+        const toggle = container.querySelector('input[type="checkbox"]') as HTMLInputElement;
+        await act(async () => { toggle.click(); });
+        expect(container.textContent).toContain("100.00 ر.س");
+        expect(container.textContent).not.toContain("الضريبة:");
+        vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ id: "invoice-1" }) } as Response);
+        await act(async () => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+        const saved = JSON.parse(vi.mocked(fetch).mock.calls[1][1]!.body as string);
+        expect(saved.lines[0].tax_rate).toBe(0);
+    });
 });

@@ -118,6 +118,9 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
             },
         ]
     );
+    const [applyTax, setApplyTax] = useState(
+        initialData?.lines ? initialData.lines.some((line) => Number(line.tax_rate) > 0) : true
+    );
 
     async function fetchPartners() {
         const res = await fetch("/api/accounting/partners");
@@ -197,7 +200,7 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
             discount = line.discount_value;
         }
         const afterDiscount = subtotal - discount;
-        const tax = (afterDiscount * line.tax_rate) / 100;
+        const tax = applyTax ? (afterDiscount * line.tax_rate) / 100 : 0;
         return afterDiscount + tax;
     };
 
@@ -219,7 +222,7 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
             totalDiscount += discount;
 
             const afterDiscount = lineSubtotal - discount;
-            const tax = (afterDiscount * line.tax_rate) / 100;
+            const tax = applyTax ? (afterDiscount * line.tax_rate) / 100 : 0;
             totalTax += tax;
         });
 
@@ -303,7 +306,7 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
                 notes,
                 payment_terms: paymentTerms,
                 attachment_url: attachmentUrl,
-                lines: items,
+                lines: items.map((line) => ({ ...line, tax_rate: applyTax ? line.tax_rate : 0 })),
             };
 
             let res;
@@ -503,6 +506,10 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
 
             {/* Invoice Lines */}
             <div className="bg-white p-6 rounded-xl border shadow-sm">
+                <label className="mb-4 flex items-center gap-2 text-sm font-medium">
+                    <input type="checkbox" checked={applyTax} onChange={(e) => setApplyTax(e.target.checked)} />
+                    تطبيق الضريبة على الفاتورة
+                </label>
                 <div className="flex justify-between items-center mb-4">
                     <h2 className="text-lg font-bold">بنود الفاتورة</h2>
                     <button
@@ -523,7 +530,7 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
                                 <th className="px-3 py-2 text-right w-24">الكمية</th>
                                 <th className="px-3 py-2 text-right w-32">السعر</th>
                                 <th className="px-3 py-2 text-right w-32">الخصم</th>
-                                <th className="px-3 py-2 text-right w-24">الضريبة %</th>
+                                {applyTax && <th className="px-3 py-2 text-right w-24">الضريبة %</th>}
                                 <th className="px-3 py-2 text-right w-32">المجموع</th>
                                 <th className="px-3 py-2 w-10"></th>
                             </tr>
@@ -583,7 +590,7 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
                                             </select>
                                         </div>
                                     </td>
-                                    <td className="px-3 py-2">
+                                    {applyTax && <td className="px-3 py-2">
                                         <input
                                             type="number"
                                             min="0"
@@ -593,7 +600,7 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
                                             onChange={(e) => updateLine(index, "tax_rate", parseFloat(e.target.value) || 0)}
                                             className="w-full px-2 py-1 border rounded text-center"
                                         />
-                                    </td>
+                                    </td>}
                                     <td className="px-3 py-2 font-medium">
                                         {calculateLineTotal(line).toFixed(2)} ر.س
                                     </td>
@@ -625,10 +632,10 @@ export function InvoiceForm({ initialData, invoiceId, invoiceType = "customer_in
                             <span>الخصم:</span>
                             <span>-{totals.totalDiscount.toFixed(2)} ر.س</span>
                         </div>
-                        <div className="flex justify-between text-green-600">
+                        {applyTax && <div className="flex justify-between text-green-600">
                             <span>الضريبة:</span>
                             <span>+{totals.totalTax.toFixed(2)} ر.س</span>
-                        </div>
+                        </div>}
                         <div className="flex justify-between text-lg font-bold pt-2 border-t">
                             <span>الإجمالي:</span>
                             <span>{totals.total.toFixed(2)} ر.س</span>

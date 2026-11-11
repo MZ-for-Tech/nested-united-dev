@@ -349,7 +349,7 @@ export default function InvoiceDetailPage() {
                         )}
                         <div>
                             <p className="font-bold text-lg">{company?.company_name || "—"}</p>
-                            {company?.tax_number && <p className="text-gray-500 text-sm">الرقم الضريبي: {company.tax_number}</p>}
+                            {Number(invoice.tax_amount) > 0 && company?.tax_number && <p className="text-gray-500 text-sm">الرقم الضريبي: {company.tax_number}</p>}
                             {company?.commercial_registration && <p className="text-gray-500 text-sm">السجل التجاري: {company.commercial_registration}</p>}
                             {company?.phone && <p className="text-gray-500 text-sm">{company.phone}</p>}
                         </div>
@@ -357,7 +357,7 @@ export default function InvoiceDetailPage() {
                     {/* Invoice Number + Status - Left Side */}
                     <div className="text-left">
                         <h2 className="text-3xl font-bold">{invoice.invoice_number}</h2>
-                        <p className="text-gray-500 mt-1 mb-2 font-bold text-lg">{company?.invoice_type_label || "فاتورة ضريبية"}</p>
+                        <p className="text-gray-500 mt-1 mb-2 font-bold text-lg">{Number(invoice.tax_amount) > 0 ? company?.invoice_type_label || "فاتورة ضريبية" : "فاتورة خدمات"}</p>
                         {getStateBadge(invoice.state)}
                     </div>
                 </div>
@@ -402,7 +402,7 @@ export default function InvoiceDetailPage() {
                             <th className="px-4 py-3 text-right text-sm font-medium">الوصف</th>
                             <th className="px-4 py-3 text-right text-sm font-medium">الكمية</th>
                             <th className="px-4 py-3 text-right text-sm font-medium">السعر</th>
-                            <th className="px-4 py-3 text-right text-sm font-medium">الضريبة</th>
+                            {Number(invoice.tax_amount) > 0 && <th className="px-4 py-3 text-right text-sm font-medium">الضريبة</th>}
                             <th className="px-4 py-3 text-right text-sm font-medium">المجموع</th>
                         </tr>
                     </thead>
@@ -412,7 +412,7 @@ export default function InvoiceDetailPage() {
                                 <td className="px-4 py-3">{line.description}</td>
                                 <td className="px-4 py-3">{line.quantity.toLocaleString("ar-SA")}</td>
                                 <td className="px-4 py-3">{line.unit_price.toLocaleString("ar-SA")} ر.س</td>
-                                <td className="px-4 py-3">{line.tax_rate}%</td>
+                                {Number(invoice.tax_amount) > 0 && <td className="px-4 py-3">{line.tax_rate}%</td>}
                                 <td className="px-4 py-3 font-medium">
                                     {line.line_total_with_tax.toLocaleString("ar-SA")} ر.س
                                 </td>
@@ -434,10 +434,10 @@ export default function InvoiceDetailPage() {
                                 <span>-{invoice.discount_amount.toLocaleString("ar-SA")} ر.س</span>
                             </div>
                         )}
-                        <div className="flex justify-between text-green-600">
+                        {Number(invoice.tax_amount) > 0 && <div className="flex justify-between text-green-600">
                             <span>الضريبة:</span>
                             <span>+{invoice.tax_amount.toLocaleString("ar-SA")} ر.س</span>
-                        </div>
+                        </div>}
                         <div className="flex justify-between text-xl font-bold pt-3 border-t">
                             <span>الإجمالي:</span>
                             <span>{invoice.total_amount.toLocaleString("ar-SA")} ر.س</span>
